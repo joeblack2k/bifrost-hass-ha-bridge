@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue};
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
@@ -45,7 +47,13 @@ pub async fn get_clip_v2(
         Ok(Event::default().id(evt_id).json_data(json)?)
     });
 
-    Sse::new(hello.chain(stream))
+    // Hue clients (especially on mobile) rely on a long-lived SSE connection to get realtime
+    // updates; without keep-alives, intermediaries/OSes can silently tear down the stream.
+    Sse::new(hello.chain(stream)).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text(": ping"),
+    )
 }
 
 pub fn router() -> Router<AppState> {

@@ -1,0 +1,21 @@
+bifrost:
+  state_file: "data/state.yaml"
+  cert_file: "data/certs/cert.pem"
+  hass_ui_file: "hass-ui.yaml"
+
+bridge:
+  name: Bifrost-HASS
+  mac: "02:42:c0:a8:02:06"
+  ipaddress: 192.168.2.6
+  http_port: 80
+  https_port: 443
+  entm_port: 2100
+  netmask: 255.255.255.0
+  gateway: 192.168.2.1
+  timezone: Europe/Amsterdam
+
+hass:
+  homeassistant:
+    url: http://192.168.2.5:8123
+    token_env: HASS_TOKEN
+    poll_interval_secs: 5

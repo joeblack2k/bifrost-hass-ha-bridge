@@ -1,0 +1,123 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --env-0: 7 11 20;
+    --env-1: 11 18 31;
+    --plastic-0: 18 28 44;
+    --plastic-1: 14 23 38;
+    --ink-0: 233 241 255;
+    --ink-1: 162 178 206;
+
+    /* Accents */
+    --accent-orange: 220 120 42;
+    --accent-green: 76 165 118;
+    --accent-red: 205 72 74;
+    --accent-blue: 50 120 210;
+
+    /* Geometry */
+    --radius-panel: 14px;
+    --radius-control: 10px;
+
+    --shadow-elev: 0 14px 34px rgba(0, 0, 0, 0.35);
+    --shadow-inset: inset 0 1px 0 rgba(255, 255, 255, 0.06), inset 0 -1px 0 rgba(0, 0, 0, 0.22);
+
+    /* Digital patina level: 0..100 */
+    --patina: 0;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    color: rgb(var(--ink-0));
+    font-family: theme(fontFamily.sans);
+    background:
+      radial-gradient(1200px 700px at 85% -20%, rgba(51, 84, 162, 0.28) 0, transparent 45%),
+      radial-gradient(900px 520px at -10% 10%, rgba(29, 49, 83, 0.45) 0, transparent 55%),
+      linear-gradient(180deg, rgb(var(--env-1)), rgb(var(--env-0)));
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+@layer components {
+  .noise-overlay {
+    position: relative;
+  }
+  .noise-overlay::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    opacity: 0.08;
+    mix-blend-mode: overlay;
+    background-image:
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.06) 0 1px, rgba(0,0,0,0) 1px 3px),
+      repeating-linear-gradient(90deg, rgba(255,255,255,0.04) 0 1px, rgba(0,0,0,0) 1px 4px);
+    border-radius: inherit;
+  }
+
+  .plastic-panel {
+    color: rgb(var(--ink-0));
+    background:
+      linear-gradient(180deg,
+        rgba(255, 255, 255, 0.06),
+        rgba(255, 255, 255, 0.01)
+      ),
+      linear-gradient(135deg,
+        rgb(var(--plastic-0)),
+        rgb(var(--plastic-1))
+      );
+    border: 1px solid rgba(132, 156, 212, 0.26);
+    border-radius: var(--radius-panel);
+    box-shadow: var(--shadow-elev);
+    filter:
+      sepia(calc(var(--patina) / 1400))
+      saturate(calc(1 - (var(--patina) / 900)))
+      contrast(1.01);
+  }
+
+  .tactile-control {
+    border-radius: var(--radius-control);
+    border: 1px solid rgba(124, 146, 201, 0.32);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,0.12), rgba(255,255,255,0.03)),
+      linear-gradient(135deg, rgba(26,42,68,0.95), rgba(19,31,52,0.95));
+    box-shadow:
+      inset 0 1px 0 rgba(255,255,255,0.12),
+      inset 0 -1px 0 rgba(0,0,0,0.26),
+      0 6px 14px rgba(0,0,0,0.22);
+  }
+
+  .tactile-control:active {
+    transform: translateY(1px);
+    box-shadow:
+      inset 0 2px 6px rgba(0,0,0,0.32),
+      0 5px 10px rgba(0,0,0,0.18);
+  }
+
+  .fingerprint {
+    position: relative;
+  }
+  .fingerprint::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border-radius: inherit;
+    opacity: calc(var(--patina) / 240);
+    background:
+      radial-gradient(120px 80px at var(--wear-x, 55%) var(--wear-y, 35%),
+        rgba(255,255,255,0.26),
+        rgba(255,255,255,0.00) 70%
+      );
+    mix-blend-mode: soft-light;
+  }
+}

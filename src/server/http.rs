@@ -111,7 +111,9 @@ where
         use openssl::ssl::{AlpnError, SslAcceptor, SslFiletype, SslMethod, SslRef};
 
         fn alpn_select<'a>(_tls: &mut SslRef, client: &'a [u8]) -> Result<&'a [u8], AlpnError> {
-            openssl::ssl::select_next_proto(b"\x02h2\x08http/1.1", client).ok_or(AlpnError::NOACK)
+            // Hue bridges are effectively HTTP/1.1 devices. Some clients (notably iOS URLSession
+            // + SSE) can be flaky with HTTP/2 event streams, so we force HTTP/1.1 here.
+            openssl::ssl::select_next_proto(b"\x08http/1.1", client).ok_or(AlpnError::NOACK)
         }
 
         // the default axum-server function for configuring openssl uses

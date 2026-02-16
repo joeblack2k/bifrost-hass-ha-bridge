@@ -7,6 +7,8 @@ pub fn parse(filename: &Utf8Path) -> Result<AppConfig, ConfigError> {
     let settings = Config::builder()
         .set_default("bifrost.state_file", "state.yaml")?
         .set_default("bifrost.cert_file", "cert.pem")?
+        .set_default("bifrost.hass_ui_file", "hass-ui.yaml")?
+        .set_default("bifrost.hass_runtime_file", "hass-runtime.yaml")?
         .set_default("bridge.http_port", 80)?
         .set_default("bridge.https_port", 443)?
         .set_default("bridge.entm_port", 2100)?

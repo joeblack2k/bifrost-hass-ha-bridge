@@ -177,6 +177,19 @@ pub struct Taurus {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "snake_case")]
+pub enum InternetConnectivityStatus {
+    Connected,
+    Disconnected,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct InternetConnectivity {
+    pub owner: ResourceLink,
+    pub status: InternetConnectivityStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
 pub enum ZigbeeConnectivityStatus {
     Connected,
     ConnectivityIssue,

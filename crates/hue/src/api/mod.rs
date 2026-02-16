@@ -52,9 +52,9 @@ pub use stream::HueStreamKey;
 pub use stubs::{
     Bridge, BridgeHome, Button, ButtonData, ButtonMetadata, ButtonReport, DevicePower,
     DeviceSoftwareUpdate, DollarRef, GeofenceClient, Geolocation, GroupedLightLevel, GroupedMotion,
-    Homekit, LightLevel, Matter, Metadata, MetadataUpdate, Motion, PrivateGroup, PublicImage,
-    RelativeRotary, SmartScene, Taurus, Temperature, TimeZone, ZigbeeConnectivity,
-    ZigbeeConnectivityStatus, Zone,
+    Homekit, InternetConnectivity, InternetConnectivityStatus, LightLevel, Matter, Metadata,
+    MetadataUpdate, Motion, PrivateGroup, PublicImage, RelativeRotary, SmartScene, Taurus,
+    Temperature, TimeZone, ZigbeeConnectivity, ZigbeeConnectivityStatus, Zone,
 };
 pub use update::Update;
 pub use zigbee_device_discovery::{
@@ -104,6 +104,7 @@ pub enum Resource {
     GroupedLightLevel(GroupedLightLevel),
     GroupedMotion(GroupedMotion),
     Homekit(Homekit),
+    InternetConnectivity(InternetConnectivity),
     Light(Light),
     LightLevel(LightLevel),
     Matter(Matter),
@@ -153,6 +154,7 @@ impl Resource {
             Self::GroupedLightLevel(_) => RType::GroupedLightLevel,
             Self::GroupedMotion(_) => RType::GroupedMotion,
             Self::Homekit(_) => RType::Homekit,
+            Self::InternetConnectivity(_) => RType::InternetConnectivity,
             Self::Light(_) => RType::Light,
             Self::LightLevel(_) => RType::LightLevel,
             Self::Matter(_) => RType::Matter,
@@ -196,6 +198,7 @@ impl Resource {
             Self::GroupedLightLevel(obj) => Some(obj.owner),
             Self::GroupedMotion(obj) => Some(obj.owner),
             Self::Homekit(_) => None,
+            Self::InternetConnectivity(obj) => Some(obj.owner),
             Self::Light(obj) => Some(obj.owner),
             Self::LightLevel(obj) => Some(obj.owner),
             Self::Matter(_) => None,
@@ -241,6 +244,7 @@ impl Resource {
             RType::GroupedLightLevel => Self::GroupedLightLevel(from_value(obj)?),
             RType::GroupedMotion => Self::GroupedMotion(from_value(obj)?),
             RType::Homekit => Self::Homekit(from_value(obj)?),
+            RType::InternetConnectivity => Self::InternetConnectivity(from_value(obj)?),
             RType::Light => Self::Light(from_value(obj)?),
             RType::LightLevel => Self::LightLevel(from_value(obj)?),
             RType::Matter => Self::Matter(from_value(obj)?),
@@ -332,6 +336,7 @@ resource_conversion_impl!(GroupedLight);
 resource_conversion_impl!(GroupedLightLevel);
 resource_conversion_impl!(GroupedMotion);
 resource_conversion_impl!(Homekit);
+resource_conversion_impl!(InternetConnectivity);
 resource_conversion_impl!(Light);
 resource_conversion_impl!(LightLevel);
 resource_conversion_impl!(Matter);

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use camino::Utf8Path;
 use chrono::Utc;
@@ -11,6 +12,7 @@ use svc::manager::SvmClient;
 
 use crate::config::AppConfig;
 use crate::error::ApiResult;
+use crate::model::hass::{HassRuntimeState, HassUiState};
 use crate::model::state::{State, StateVersion};
 use crate::resource::Resources;
 use crate::server::certificate;
@@ -22,6 +24,9 @@ pub struct AppState {
     upd: Arc<Mutex<VersionUpdater>>,
     svm: SvmClient,
     pub res: Arc<Mutex<Resources>>,
+    hass_ui: Arc<Mutex<HassUiState>>,
+    hass_runtime: Arc<Mutex<HassRuntimeState>>,
+    linkbutton_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AppState {
@@ -64,7 +69,21 @@ impl AppState {
         }
 
         res.reset_all_streaming()?;
+        res.ensure_core_bridge_resources(&hue::bridge_id(config.bridge.mac))?;
 
+        let hass_ui = Arc::new(Mutex::new(HassUiState::load(
+            config.bifrost.hass_ui_file.clone(),
+        )?));
+        let fallback_hass_url = config
+            .hass
+            .servers
+            .values()
+            .next()
+            .map(|server| server.url.to_string());
+        let hass_runtime = Arc::new(Mutex::new(HassRuntimeState::load(
+            config.bifrost.hass_runtime_file.clone(),
+            fallback_hass_url,
+        )?));
         let conf = Arc::new(config);
         let res = Arc::new(Mutex::new(res));
 
@@ -73,6 +92,9 @@ impl AppState {
             upd,
             svm,
             res,
+            hass_ui,
+            hass_runtime,
+            linkbutton_until: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -92,6 +114,34 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn hass_ui(&self) -> Arc<Mutex<HassUiState>> {
+        self.hass_ui.clone()
+    }
+
+    #[must_use]
+    pub fn hass_runtime(&self) -> Arc<Mutex<HassRuntimeState>> {
+        self.hass_runtime.clone()
+    }
+
+    pub async fn press_linkbutton(&self, active_for: Duration) {
+        let mut lock = self.linkbutton_until.lock().await;
+        *lock = Some(Instant::now() + active_for);
+    }
+
+    pub async fn linkbutton_active(&self) -> bool {
+        let now = Instant::now();
+        let mut lock = self.linkbutton_until.lock().await;
+        match *lock {
+            Some(until) if until > now => true,
+            Some(_) => {
+                *lock = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    #[must_use]
     pub async fn api_short_config(&self) -> ApiShortConfig {
         let mac = self.conf.bridge.mac;
         ApiShortConfig::from_mac_and_version(mac, self.upd.lock().await.get().await)
@@ -100,6 +150,7 @@ impl AppState {
     pub async fn api_config(&self, username: String) -> ApiResult<ApiConfig> {
         let tz = tzfile::Tz::named(&self.conf.bridge.timezone)?;
         let localtime = Utc::now().with_timezone(&&tz).naive_local();
+        let linkbutton = self.linkbutton_active().await;
 
         let res = ApiConfig {
             short_config: self.api_short_config().await,
@@ -116,6 +167,7 @@ impl AppState {
                 },
             )]),
             localtime,
+            linkbutton,
             ..ApiConfig::default()
         };
 

@@ -1,0 +1,21 @@
+services:
+  bifrost-hass:
+    container_name: bifrost-hass
+    build:
+      context: /home/homelab/work/bifrost-hass
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - /opt/config/secrets/bifrost-hass/bifrost-hass.env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./hass-ui.yaml:/app/hass-ui.yaml
+      - ./data:/app/data
+    networks:
+      lan_macvlan:
+        ipv4_address: 192.168.2.6
+
+networks:
+  lan_macvlan:
+    external: true
+    name: macvlan_network

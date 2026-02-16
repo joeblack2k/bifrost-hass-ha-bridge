@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod hass;
 pub mod service;
 pub mod websocket;
 
@@ -53,6 +54,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .nest("/service", service::router())
         .nest("/backend", backend::router())
+        .merge(hass::router())
         .route("/config", get(get_config))
         .route("/ws", any(websocket))
 }

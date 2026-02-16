@@ -1,0 +1,13 @@
+services:
+  bifrost-hass:
+    image: ghcr.io/joeblack2k/bifrost-hass:latest
+    container_name: bifrost-hass
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - ./bifrost-hass.env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./hass-ui.yaml:/app/hass-ui.yaml
+      - ./hass-runtime.yaml:/app/hass-runtime.yaml
+      - ./data:/app/data

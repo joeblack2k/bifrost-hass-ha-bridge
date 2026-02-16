@@ -1,6 +1,8 @@
 bifrost:
   # Override the default path to the one used in the docker image
   cert_file: "certs/cert.pem"
+  hass_ui_file: "hass-ui.yaml"
+  hass_runtime_file: "hass-runtime.yaml"
 
 bridge:
   name: Bifrost
@@ -13,3 +15,8 @@ bridge:
 z2m:
   server1:
     url: ws://10.0.0.100:8080
+
+hass:
+  homeassistant:
+    url: http://192.168.2.5:8123
+    token_env: HASS_TOKEN

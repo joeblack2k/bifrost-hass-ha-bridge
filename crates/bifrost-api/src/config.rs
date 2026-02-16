@@ -30,9 +30,11 @@ pub struct BridgeConfig {
 pub struct BifrostConfig {
     pub state_file: Utf8PathBuf,
     pub cert_file: Utf8PathBuf,
+    pub hass_ui_file: Utf8PathBuf,
+    pub hass_runtime_file: Utf8PathBuf,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq)]
 pub struct Z2mConfig {
     #[serde(flatten)]
     pub servers: BTreeMap<String, Z2mServer>,
@@ -47,6 +49,19 @@ pub struct Z2mServer {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq)]
+pub struct HassConfig {
+    #[serde(flatten)]
+    pub servers: BTreeMap<String, HassServer>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct HassServer {
+    pub url: Url,
+    pub token_env: Option<String>,
+    pub poll_interval_secs: Option<NonZeroU32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default, Eq, PartialEq)]
 pub struct RoomConfig {
     pub name: Option<String>,
     pub icon: Option<RoomArchetype>,
@@ -55,10 +70,20 @@ pub struct RoomConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     pub bridge: BridgeConfig,
+    #[serde(default)]
     pub z2m: Z2mConfig,
+    #[serde(default)]
+    pub hass: HassConfig,
     pub bifrost: BifrostConfig,
     #[serde(default)]
     pub rooms: BTreeMap<String, RoomConfig>,
+}
+
+impl AppConfig {
+    #[must_use]
+    pub fn has_backends(&self) -> bool {
+        !self.z2m.servers.is_empty() || !self.hass.servers.is_empty()
+    }
 }
 
 impl Z2mServer {

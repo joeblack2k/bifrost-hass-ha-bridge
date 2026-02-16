@@ -4,6 +4,7 @@ pub mod grouped_light;
 pub mod light;
 pub mod room;
 pub mod scene;
+pub mod sensor;
 pub mod zigbee_device_discovery;
 
 use bifrost_api::backend::BackendRequest;
@@ -59,6 +60,12 @@ async fn get_all_resources(State(state): State<AppState>) -> ApiV2Result {
     V2Reply::list(res)
 }
 
+async fn get_wifi_connectivity() -> ApiV2Result {
+    // The Hue mobile app probes this resource on some bridge onboarding flows.
+    // We do not model wifi connectivity in Bifrost, so return an empty list.
+    V2Reply::list(Vec::<Value>::new())
+}
+
 pub async fn get_resource(State(state): State<AppState>, Path(rtype): Path<RType>) -> ApiV2Result {
     let lock = state.res.lock().await;
     let res = lock.get_resources_by_type(rtype);
@@ -110,6 +117,7 @@ async fn post_resource(
         | RType::Light
         | RType::LightLevel
         | RType::Matter
+        | RType::InternetConnectivity
         | RType::MatterFabric
         | RType::Motion
         | RType::PrivateGroup
@@ -149,6 +157,7 @@ async fn put_resource_id(
         RType::EntertainmentConfiguration => ent_conf::put_resource_id(&state, rlink, put).await,
         RType::GroupedLight => grouped_light::put_grouped_light(&state, rlink, put).await,
         RType::Light => light::put_light(&state, rlink, put).await,
+        RType::Motion | RType::Contact => sensor::put_sensor(&state, rlink, put).await,
         RType::Scene => scene::put_scene(&state, rlink, put).await,
         RType::Room => room::put_room(&state, rlink, put).await,
         RType::ZigbeeDeviceDiscovery => {
@@ -160,7 +169,6 @@ async fn put_resource_id(
         | RType::Bridge
         | RType::Button
         | RType::CameraMotion
-        | RType::Contact
         | RType::DevicePower
         | RType::DeviceSoftwareUpdate
         | RType::Entertainment
@@ -169,9 +177,9 @@ async fn put_resource_id(
         | RType::GroupedLightLevel
         | RType::GroupedMotion
         | RType::Homekit
+        | RType::InternetConnectivity
         | RType::LightLevel
         | RType::Matter
-        | RType::Motion
         | RType::RelativeRotary
         | RType::ServiceGroup
         | RType::SmartScene
@@ -250,6 +258,7 @@ async fn delete_resource_id(
         | RType::GroupedLightLevel
         | RType::GroupedMotion
         | RType::Homekit
+        | RType::InternetConnectivity
         | RType::Light
         | RType::LightLevel
         | RType::Matter
@@ -273,6 +282,7 @@ async fn delete_resource_id(
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(get_all_resources))
+        .route("/wifi_connectivity", get(get_wifi_connectivity))
         .route("/{rtype}", get(get_resource))
         .route("/{rtype}", post(post_resource))
         .route("/{rtype}/{rid}", get(get_resource_id))

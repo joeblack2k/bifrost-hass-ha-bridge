@@ -149,12 +149,23 @@ impl Default for ApiInternetServices {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PortalState {
     communication: ConnectionState,
     incoming: bool,
     outgoing: bool,
     signedon: bool,
+}
+
+impl Default for PortalState {
+    fn default() -> Self {
+        Self {
+            communication: ConnectionState::Connected,
+            incoming: true,
+            outgoing: true,
+            signedon: true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -786,7 +797,7 @@ impl Default for ApiConfig {
             dhcp: true,
             internetservices: ApiInternetServices::default(),
             linkbutton: Default::default(),
-            portalconnection: ConnectionState::Disconnected,
+            portalconnection: ConnectionState::Connected,
             portalservices: true,
             portalstate: PortalState::default(),
             proxyaddress: "none".to_string(),

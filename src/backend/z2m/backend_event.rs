@@ -488,6 +488,13 @@ impl Z2mBackend {
             BackendRequest::LightUpdate(link, upd) => {
                 self.backend_light_update(z2mws, link, upd).await
             }
+            BackendRequest::SensorEnabledUpdate(_, _) => Ok(()),
+            BackendRequest::HassSync => Ok(()),
+            BackendRequest::HassUpsertEntity(_) => Ok(()),
+            BackendRequest::HassRemoveEntity(_) => Ok(()),
+            BackendRequest::HassUpdateRooms => Ok(()),
+            BackendRequest::HassConnect => Ok(()),
+            BackendRequest::HassDisconnect => Ok(()),
 
             BackendRequest::SceneCreate(link, sid, scene) => {
                 self.backend_scene_create(z2mws, link, *sid, scene).await

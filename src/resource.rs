@@ -17,6 +17,7 @@ use hue::api::{
     ResourceRecord, Room, Stub, TimeZone, ZigbeeConnectivity, ZigbeeConnectivityStatus,
     ZigbeeDeviceDiscovery, ZigbeeDeviceDiscoveryAction, ZigbeeDeviceDiscoveryStatus, Zone,
 };
+use hue::api::{InternetConnectivity, InternetConnectivityStatus};
 use hue::error::{HueError, HueResult};
 use hue::event::EventBlock;
 use hue::version::SwVersion;
@@ -91,6 +92,47 @@ impl Resources {
 
     pub fn init(&mut self, bridge_id: &str) -> ApiResult<()> {
         self.add_bridge(bridge_id.to_owned())
+    }
+
+    /// Wipe the Hue resource database and re-initialize the bridge core resources.
+    ///
+    /// This is intended for "start over" onboarding in the Hue app.
+    pub fn factory_reset(&mut self, bridge_id: &str) -> ApiResult<()> {
+        self.state = State::new();
+        self.add_bridge(bridge_id.to_owned())?;
+        self.state_updates.notify_one();
+        Ok(())
+    }
+
+    /// Patch older state files with any new "core bridge" resources that the Hue app expects.
+    ///
+    /// This is intentionally additive and safe to run on every startup.
+    pub fn ensure_core_bridge_resources(&mut self, bridge_id: &str) -> ApiResult<()> {
+        let link_bridge = RType::Bridge.deterministic(bridge_id);
+        let link_bridge_dev = RType::Device.deterministic(link_bridge.rid);
+        let link_ic = RType::InternetConnectivity.deterministic(link_bridge.rid);
+
+        // If the bridge device doesn't exist yet, there's nothing sensible to patch.
+        if self.state.try_get(&link_bridge_dev.rid).is_none() {
+            return Ok(());
+        }
+
+        // Hue app probes /clip/v2/resource/internet_connectivity on some onboarding flows.
+        if self.state.try_get(&link_ic.rid).is_none() {
+            let ic = InternetConnectivity {
+                owner: link_bridge_dev,
+                status: InternetConnectivityStatus::Connected,
+            };
+            self.add(&link_ic, Resource::InternetConnectivity(ic))?;
+        }
+
+        // Ensure the bridge device advertises the service link too.
+        self.try_update::<Device>(&link_bridge_dev.rid, |dev| {
+            dev.services.insert(link_ic);
+            Ok(())
+        })?;
+
+        Ok(())
     }
 
     pub fn aux_get(&self, link: &ResourceLink) -> ApiResult<&AuxData> {
@@ -279,12 +321,13 @@ impl Resources {
         let link_bridge_ent = RType::Entertainment.deterministic(link_bridge.rid);
         let link_zbdd = RType::ZigbeeDeviceDiscovery.deterministic(link_bridge.rid);
         let link_zbc = RType::ZigbeeConnectivity.deterministic(link_bridge.rid);
+        let link_ic = RType::InternetConnectivity.deterministic(link_bridge.rid);
         let link_bhome_glight = RType::GroupedLight.deterministic(link_bridge_home.rid);
 
         let bridge_dev = Device {
             product_data: DeviceProductData::hue_bridge_v2(&self.version),
             metadata: Metadata::new(DeviceArchetype::BridgeV2, "Bifrost"),
-            services: btreeset![link_bridge, link_zbc, link_bridge_ent, link_zbdd],
+            services: btreeset![link_bridge, link_zbc, link_ic, link_bridge_ent, link_zbdd],
             identify: Some(Stub),
             usertest: None,
         };
@@ -352,6 +395,13 @@ impl Resources {
             extended_pan_id: None,
         };
 
+        let ic = InternetConnectivity {
+            owner: link_bridge_dev,
+            // For local bridge emulation, we report connected. The Hue app uses this resource
+            // during onboarding and general health checks.
+            status: InternetConnectivityStatus::Connected,
+        };
+
         let brent = Entertainment {
             equalizer: false,
             owner: link_bridge_dev,
@@ -368,6 +418,7 @@ impl Resources {
         self.add(&link_bridge_home, Resource::BridgeHome(bridge_home))?;
         self.add(&link_zbdd, Resource::ZigbeeDeviceDiscovery(zbdd))?;
         self.add(&link_zbc, Resource::ZigbeeConnectivity(zbc))?;
+        self.add(&link_ic, Resource::InternetConnectivity(ic))?;
         self.add(&link_bridge_ent, Resource::Entertainment(brent))?;
         self.add(&link_bhome_glight, Resource::GroupedLight(bhome_glight))?;
 
@@ -485,6 +536,7 @@ impl Resources {
             | Resource::GroupedLightLevel(_)
             | Resource::GroupedMotion(_)
             | Resource::Homekit(_)
+            | Resource::InternetConnectivity(_)
             | Resource::LightLevel(_)
             | Resource::Matter(_)
             | Resource::MatterFabric(_)

@@ -12,6 +12,9 @@ use svc::manager::SvmClient;
 use svc::serviceid::ServiceId;
 use tokio::signal;
 use tokio::signal::unix::SignalKind;
+use url::Url;
+
+use bifrost_api::config::HassServer;
 
 /*
  * Formatter function to output in syslog format. This makes sense when running
@@ -119,9 +122,38 @@ async fn build_tasks(appstate: &AppState) -> ApiResult<()> {
     let template = backend::z2m::Z2mServiceTemplate::new(appstate.clone());
     mgr.register_template("z2m", template).await?;
 
+    // register all Home Assistant backends as services
+    let template = backend::hass::HassServiceTemplate::new(appstate.clone());
+    mgr.register_template("hass", template).await?;
+
     // start named z2m instances, since templated services appear when started
     for name in appstate.config().z2m.servers.keys() {
         mgr.start(ServiceId::instance("z2m", name)).await?;
+    }
+
+    // start named hass instances, since templated services appear when started
+    for name in appstate.config().hass.servers.keys() {
+        mgr.start(ServiceId::instance("hass", name)).await?;
+    }
+
+    if appstate.config().hass.servers.is_empty() {
+        log::info!("No static hass servers configured, starting runtime hass backend");
+        let fallback_url = Url::parse("http://127.0.0.1:8123")
+            .expect("fallback Home Assistant URL should always be valid");
+        let server = HassServer {
+            url: fallback_url,
+            token_env: Some("HASS_TOKEN".to_string()),
+            poll_interval_secs: None,
+        };
+        let svc = backend::hass::HassBackend::new(
+            "runtime".to_string(),
+            server,
+            appstate.res.clone(),
+            appstate.hass_ui(),
+            appstate.hass_runtime(),
+        )?;
+        mgr.register_service("hass-runtime", svc).await?;
+        mgr.start("hass-runtime").await?;
     }
 
     // finally, iterate over all services and start them
@@ -165,6 +197,15 @@ async fn run() -> ApiResult<()> {
 
     let config = config::parse("config.yaml".into())?;
     log::debug!("Configuration loaded successfully");
+
+    if !config.has_backends() {
+        log::warn!("{}", "-".repeat(80));
+        log::warn!("No backends configured in config!");
+        log::warn!("Bifrost will run, but cannot control any lights.");
+        log::warn!("");
+        log::warn!(" ** Please configure at least one backend to use Bifrost **");
+        log::warn!("{}", "-".repeat(80));
+    }
 
     let (client, future) = ServiceManager::spawn();
 

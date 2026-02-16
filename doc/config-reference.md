@@ -22,6 +22,14 @@ bifrost:
   # (this might require pairing the Hue App again)
   cert_file: "cert.pem"
 
+  # name of yaml file used by /bifrost/ui
+  # to store Home Assistant filtering preferences
+  hass_ui_file: "hass-ui.yaml"
+
+  # name of yaml file used by /bifrost/ui
+  # to store runtime Home Assistant URL/token settings
+  hass_runtime_file: "hass-runtime.yaml"
+
 # Bridge section
 #
 # Settings for hue bridge emulation
@@ -51,7 +59,24 @@ bridge:
   # For advanced users (e.g. bifrost behind a port forwarded firewall)
   entm_port: 2100
 
-# Zigbee2mqtt section
+# Configure at least one backend.
+#
+# You can use `hass`, `z2m`, or both at the same time.
+#
+# Home Assistant section [optional!]
+#
+# Make a sub-section for each Home Assistant server.
+hass:
+  homeassistant:
+    # Base URL to your Home Assistant instance.
+    # Usually http://<ip>:8123 on LAN.
+    url: http://192.168.2.5:8123
+
+    # Environment variable containing a long-lived access token.
+    # If omitted, defaults to HASS_TOKEN.
+    token_env: HASS_TOKEN
+
+# Zigbee2mqtt section [optional!]
 #
 # Make a sub-section for each zigbee2mqtt server you want to connect
 #
