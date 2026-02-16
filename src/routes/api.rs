@@ -88,15 +88,19 @@ fn get_groups(res: &MutexGuard<Resources>, group_0: bool) -> ApiResult<HashMap<S
         let lights: Vec<String> = room
             .children
             .iter()
-            .filter_map(|rl| res.get(rl).ok())
-            .filter(|dev| {
-                let dev = *dev;
-                !matches!(
+            .filter_map(|rl| res.get::<Device>(rl).ok())
+            .filter_map(|dev| {
+                let is_plug = matches!(
                     dev.product_data.product_archetype,
                     DeviceArchetype::Plug
-                ) && !matches!(dev.metadata.archetype, DeviceArchetype::Plug)
+                ) || matches!(dev.metadata.archetype, DeviceArchetype::Plug);
+
+                if is_plug {
+                    None
+                } else {
+                    dev.light_service()
+                }
             })
-            .filter_map(Device::light_service)
             .filter_map(|rl| res.get_id_v1(rl.rid).ok())
             .collect();
 
