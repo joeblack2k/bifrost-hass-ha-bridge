@@ -11,6 +11,8 @@ Bifrost emulates a Philips Hue Bridge and can expose lights/switches from:
 
 This repository is a Home Assistant focused fork:
 
+- Canonical repo: https://github.com/joeblack2k/bifrost-hass-ha-bridge
+
 - Adds a dedicated `hass` backend with Home Assistant runtime token/url management
 - Exposes `light.*`, `switch.*`, and `binary_sensor.*` (motion/contact mapping)
 - Includes a modern web UI at `/bifrost/ui` (tabs, search, room mapping, bridge actions)
@@ -310,7 +312,7 @@ Consider joining us on discord:
 [![Join Valhalla on Discord](https://discordapp.com/api/guilds/1276604041727578144/widget.png?style=banner2)](https://discord.gg/YvBKjHBJpA)
 
 If you have any problems, questions or suggestions, feel free to [create an
-issue](https://github.com/chrivers/bifrost/issues) on this project.
+issue](https://github.com/joeblack2k/bifrost-hass-ha-bridge/issues) on this project.
 
 Also, pull requests are always welcome!
 
