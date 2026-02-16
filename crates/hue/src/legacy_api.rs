@@ -630,13 +630,11 @@ impl ApiLight {
         let has_color = light.color.is_some();
         let has_ct = light.color_temperature.is_some();
         let has_dim = light.dimming.is_some();
-        let is_plug = matches!(
-            light.metadata.archetype,
-            api::DeviceArchetype::Plug
-        ) || matches!(
-            dev.product_data.product_archetype,
-            api::DeviceArchetype::Plug
-        );
+        let is_plug = matches!(light.metadata.archetype, api::DeviceArchetype::Plug)
+            || matches!(
+                dev.product_data.product_archetype,
+                api::DeviceArchetype::Plug
+            );
         let colormode = if has_color {
             Some(LightColorMode::Xy)
         } else if has_ct {
@@ -674,7 +672,10 @@ impl ApiLight {
 
         let mut capabilities = Map::new();
         capabilities.insert("certified".to_string(), Value::Bool(true));
-        capabilities.insert("streaming".to_string(), json!({"proxy": true, "renderer": true}));
+        capabilities.insert(
+            "streaming".to_string(),
+            json!({"proxy": true, "renderer": true}),
+        );
         if !control.is_empty() {
             capabilities.insert("control".to_string(), Value::Object(control));
         }
@@ -685,7 +686,9 @@ impl ApiLight {
         Self {
             state: ApiLightState {
                 on: light.on.on,
-                bri: light.dimming.map(|dim| ((dim.brightness * 2.54) as u32).max(1)),
+                bri: light
+                    .dimming
+                    .map(|dim| ((dim.brightness * 2.54) as u32).max(1)),
                 hue: None,
                 sat: None,
                 effect: if is_plug { None } else { Some("none".into()) },

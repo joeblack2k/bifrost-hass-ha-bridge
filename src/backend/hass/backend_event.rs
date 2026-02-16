@@ -5,13 +5,11 @@ use serde_json::{Map, Value, json};
 
 use bifrost_api::backend::BackendRequest;
 use hue::api::{
-    GroupedLight, GroupedLightUpdate, LightUpdate, Motion, Resource, ResourceLink, Room,
-    Scene, SceneActive, SceneStatus, SceneStatusEnum, SceneUpdate,
+    GroupedLight, GroupedLightUpdate, LightUpdate, Motion, Resource, ResourceLink, Room, Scene,
+    SceneActive, SceneStatus, SceneStatusEnum, SceneUpdate,
 };
 
-use crate::backend::hass::{
-    HassBackend, HassEntityBinding, HassEntityKind, HassServiceKind,
-};
+use crate::backend::hass::{HassBackend, HassEntityBinding, HassEntityKind, HassServiceKind};
 use crate::error::ApiResult;
 use crate::model::hass::HassSwitchMode;
 
@@ -203,7 +201,10 @@ impl HassBackend {
         scene: &Scene,
     ) -> ApiResult<()> {
         let mut lock = self.state.lock().await;
-        lock.aux_set(link_scene, crate::model::state::AuxData::new().with_index(sid));
+        lock.aux_set(
+            link_scene,
+            crate::model::state::AuxData::new().with_index(sid),
+        );
         lock.add(link_scene, Resource::Scene(scene.clone()))?;
 
         let snapshot_entities = lock
@@ -331,7 +332,8 @@ impl HassBackend {
             }
             BackendRequest::SensorEnabledUpdate(link, enabled) => {
                 if let Some(binding) = self.lookup_binding_by_sensor(link) {
-                    self.backend_sensor_enabled_update(&binding, *enabled).await?;
+                    self.backend_sensor_enabled_update(&binding, *enabled)
+                        .await?;
                 }
             }
             BackendRequest::HassSync => {
@@ -362,7 +364,8 @@ impl HassBackend {
                     let _ = rt.save();
                 }
                 self.ws = None;
-                self.ui_log("Home Assistant backend disconnected by user").await;
+                self.ui_log("Home Assistant backend disconnected by user")
+                    .await;
             }
             BackendRequest::GroupedLightUpdate(link, upd) => {
                 self.backend_grouped_light_update(link, upd).await?;

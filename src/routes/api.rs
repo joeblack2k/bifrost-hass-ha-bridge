@@ -12,12 +12,12 @@ use tokio::sync::MutexGuard;
 
 use bifrost_api::backend::BackendRequest;
 use hue::api::{
-    Device, DeviceArchetype, Entertainment, EntertainmentConfiguration, EntertainmentConfigurationAction,
-    EntertainmentConfigurationLocationsNew, EntertainmentConfigurationMetadata,
-    EntertainmentConfigurationNew, EntertainmentConfigurationServiceLocationsNew,
-    EntertainmentConfigurationType, EntertainmentConfigurationUpdate, GroupedLight,
-    GroupedLightUpdate, Light, LightUpdate, RType, ResourceLink, Room, Scene, SceneActive,
-    SceneStatus, SceneUpdate, V1Reply,
+    Device, DeviceArchetype, Entertainment, EntertainmentConfiguration,
+    EntertainmentConfigurationAction, EntertainmentConfigurationLocationsNew,
+    EntertainmentConfigurationMetadata, EntertainmentConfigurationNew,
+    EntertainmentConfigurationServiceLocationsNew, EntertainmentConfigurationType,
+    EntertainmentConfigurationUpdate, GroupedLight, GroupedLightUpdate, Light, LightUpdate, RType,
+    ResourceLink, Room, Scene, SceneActive, SceneStatus, SceneUpdate, V1Reply,
 };
 use hue::error::{HueApiV1Error, HueError, HueResult};
 use hue::legacy_api::{
@@ -38,7 +38,9 @@ use crate::server::appstate::AppState;
 async fn get_api_config(State(state): State<AppState>) -> Json<impl Serialize> {
     match state.api_config("testuser".to_string()).await {
         Ok(cfg) => Json(serde_json::to_value(cfg).unwrap_or_else(|_| json!({}))),
-        Err(_) => Json(serde_json::to_value(state.api_short_config().await).unwrap_or_else(|_| json!({}))),
+        Err(_) => {
+            Json(serde_json::to_value(state.api_short_config().await).unwrap_or_else(|_| json!({})))
+        }
     }
 }
 
@@ -93,16 +95,10 @@ fn get_groups(res: &MutexGuard<Resources>, group_0: bool) -> ApiResult<HashMap<S
             .iter()
             .filter_map(|rl| res.get::<Device>(rl).ok())
             .filter_map(|dev| {
-                let is_plug = matches!(
-                    dev.product_data.product_archetype,
-                    DeviceArchetype::Plug
-                ) || matches!(dev.metadata.archetype, DeviceArchetype::Plug);
+                let is_plug = matches!(dev.product_data.product_archetype, DeviceArchetype::Plug)
+                    || matches!(dev.metadata.archetype, DeviceArchetype::Plug);
 
-                if is_plug {
-                    None
-                } else {
-                    dev.light_service()
-                }
+                if is_plug { None } else { dev.light_service() }
             })
             .filter_map(|rl| res.get_id_v1(rl.rid).ok())
             .collect();

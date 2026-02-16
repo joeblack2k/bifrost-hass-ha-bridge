@@ -161,7 +161,9 @@ impl HassClient {
 
     pub fn set_runtime(&mut self, base_url: Url, token: Option<String>) -> ApiResult<()> {
         self.base_url = base_url;
-        self.token = token.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+        self.token = token
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty());
         if self.token.is_none() {
             return Err(ApiError::service_error(format!(
                 "[{}] Home Assistant token not configured",
@@ -229,36 +231,21 @@ impl HassClient {
 
     pub async fn get_states(&self) -> ApiResult<Vec<HassState>> {
         let url = self.endpoint_url("/api/states")?;
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(self.token()?)
-            .send()
-            .await?;
+        let response = self.http.get(url).bearer_auth(self.token()?).send().await?;
         let response = self.check_status(response, "GET /api/states").await?;
         Ok(response.json().await?)
     }
 
     pub async fn get_core_config(&self) -> ApiResult<HassCoreConfig> {
         let url = self.endpoint_url("/api/config")?;
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(self.token()?)
-            .send()
-            .await?;
+        let response = self.http.get(url).bearer_auth(self.token()?).send().await?;
         let response = self.check_status(response, "GET /api/config").await?;
         Ok(response.json().await?)
     }
 
     pub async fn get_state(&self, entity_id: &str) -> ApiResult<HassState> {
         let url = self.endpoint_url(&format!("/api/states/{entity_id}"))?;
-        let response = self
-            .http
-            .get(url)
-            .bearer_auth(self.token()?)
-            .send()
-            .await?;
+        let response = self.http.get(url).bearer_auth(self.token()?).send().await?;
         let response = self
             .check_status(response, &format!("GET /api/states/{entity_id}"))
             .await?;
@@ -273,7 +260,9 @@ impl HassClient {
             .http
             .post(url)
             .bearer_auth(self.token()?)
-            .json(&HassTemplateRequest { template: &template })
+            .json(&HassTemplateRequest {
+                template: &template,
+            })
             .send()
             .await?;
         let response = self
@@ -332,7 +321,10 @@ impl HassClient {
     ) -> ApiResult<()> {
         let url = self.endpoint_url(&format!("/api/services/{domain}/{service}"))?;
         if !entity_id.trim().is_empty() {
-            data.insert("entity_id".to_string(), Value::String(entity_id.to_string()));
+            data.insert(
+                "entity_id".to_string(),
+                Value::String(entity_id.to_string()),
+            );
         }
         let payload = Value::Object(data);
 
@@ -456,9 +448,7 @@ impl HassClient {
             }
         }
 
-        Ok(HassWs {
-            socket,
-        })
+        Ok(HassWs { socket })
     }
 
     pub async fn set_entity_registry_disabled(

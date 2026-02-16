@@ -416,7 +416,9 @@ impl HassUiConfig {
             .entity_preferences
             .entry(entity_id.to_string())
             .or_default();
-        pref.alias = alias.map(|x| x.trim().to_string()).filter(|x| !x.is_empty());
+        pref.alias = alias
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty());
         self.normalize();
     }
 
@@ -611,7 +613,11 @@ impl HassUiConfig {
         let name_lc = display_name.to_ascii_lowercase();
 
         // Explicit per-entity visibility overrides patterns/defaults.
-        if let Some(visible) = self.entity_preferences.get(entity_id).and_then(|x| x.visible) {
+        if let Some(visible) = self
+            .entity_preferences
+            .get(entity_id)
+            .and_then(|x| x.visible)
+        {
             return visible;
         }
 
@@ -963,7 +969,9 @@ impl HassUiState {
         if patina.install_date.trim().is_empty() {
             patina.install_date = Utc::now().to_rfc3339();
         }
-        patina.interactions_by_key.retain(|k, _| !k.trim().is_empty());
+        patina
+            .interactions_by_key
+            .retain(|k, _| !k.trim().is_empty());
         let file = File::create(&self.file)?;
         let state = HassUiStateFile {
             config: cfg,
@@ -989,8 +997,8 @@ impl HassUiState {
     pub fn patina_public(&self) -> HassPatinaPublic {
         let days = self.patina_days_since_install().min(365);
         let age_component = u8::try_from((days * 20) / 365).unwrap_or(20);
-        let interaction_component = u8::try_from((self.patina.interaction_count.min(5000) * 80) / 5000)
-            .unwrap_or(80);
+        let interaction_component =
+            u8::try_from((self.patina.interaction_count.min(5000) * 80) / 5000).unwrap_or(80);
         let level = age_component.saturating_add(interaction_component).min(100);
         let stage = if level >= 71 {
             HassPatinaStage::Loved

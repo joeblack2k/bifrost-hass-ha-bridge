@@ -2,12 +2,12 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::header;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
-use axum::Router;
 use bifrost_api::backend::BackendRequest;
 use hue::api::{Device, RType};
 use tower_http::services::{ServeDir, ServeFile};
@@ -17,7 +17,8 @@ use crate::model::hass::{
     HassEntityPatchRequest, HassLinkButtonResponse, HassLogsResponse, HassPatinaEventRequest,
     HassPatinaPublic, HassResetBridgeResponse, HassRoomCreateRequest, HassRoomDeleteRequest,
     HassRoomRenameRequest, HassRoomsResponse, HassRuntimeConfigPublic, HassRuntimeConfigUpdate,
-    HassSensorKind, HassSwitchMode, HassSyncResponse, HassTokenRequest, HassUiConfig, HassUiPayload,
+    HassSensorKind, HassSwitchMode, HassSyncResponse, HassTokenRequest, HassUiConfig,
+    HassUiPayload,
 };
 use crate::routes::bifrost::BifrostApiResult;
 use crate::routes::extractor::Json;
@@ -46,7 +47,9 @@ fn resolve_ui_dir() -> String {
 }
 
 fn looks_like_asset(path: &str) -> bool {
-    path.rsplit('/').next().is_some_and(|part| part.contains('.'))
+    path.rsplit('/')
+        .next()
+        .is_some_and(|part| part.contains('.'))
 }
 
 async fn ui_cache_control(req: Request, next: Next) -> Response {
@@ -108,7 +111,9 @@ async fn put_ui_config(
     Ok(Json(normalized))
 }
 
-async fn get_entities(State(state): State<AppState>) -> BifrostApiResult<Json<HassEntitiesResponse>> {
+async fn get_entities(
+    State(state): State<AppState>,
+) -> BifrostApiResult<Json<HassEntitiesResponse>> {
     let ui = state.hass_ui();
     let entities = ui.lock().await.entities.clone();
     Ok(Json(HassEntitiesResponse { entities }))
@@ -265,7 +270,11 @@ async fn put_room(
     let ui = state.hass_ui();
     let mut lock = ui.lock().await;
     lock.rename_room(&req.room_id, &req.name);
-    lock.persist_and_log(&format!("Renamed room {} to {}", req.room_id, req.name.trim()))?;
+    lock.persist_and_log(&format!(
+        "Renamed room {} to {}",
+        req.room_id,
+        req.name.trim()
+    ))?;
     let response = HassRoomsResponse {
         rooms: lock.config_normalized().rooms,
     };
@@ -341,7 +350,10 @@ async fn get_bridge_info(State(state): State<AppState>) -> BifrostApiResult<Json
                 let mut include = cfg.should_include(&ent.entity_id, &ent.name, ent.available);
                 if ent.domain == "binary_sensor" {
                     let detected = ent.sensor_kind.unwrap_or(HassSensorKind::Ignore);
-                    if matches!(cfg.sensor_kind(&ent.entity_id, detected), HassSensorKind::Ignore) {
+                    if matches!(
+                        cfg.sensor_kind(&ent.entity_id, detected),
+                        HassSensorKind::Ignore
+                    ) {
                         include = false;
                     }
                 }
@@ -440,16 +452,17 @@ async fn post_apply(State(state): State<AppState>) -> BifrostApiResult<Json<Hass
         let mut include = cfg.should_include(&ent.entity_id, &ent.name, ent.available);
         if ent.domain == "binary_sensor" {
             let detected = ent.sensor_kind.unwrap_or(HassSensorKind::Ignore);
-            if matches!(cfg.sensor_kind(&ent.entity_id, detected), HassSensorKind::Ignore) {
+            if matches!(
+                cfg.sensor_kind(&ent.entity_id, detected),
+                HassSensorKind::Ignore
+            ) {
                 include = false;
             }
         }
 
         if include {
-            let link = RType::Device.deterministic(format!(
-                "hass:{}:{}:device",
-                backend_name, ent.entity_id
-            ));
+            let link = RType::Device
+                .deterministic(format!("hass:{}:{}:device", backend_name, ent.entity_id));
             keep_device_rids.insert(link.rid);
         }
     }
@@ -637,7 +650,10 @@ pub fn router() -> Router<AppState> {
         .route("/hass/ui-config", get(get_ui_config).put(put_ui_config))
         .route("/hass/entities", get(get_entities))
         .route("/hass/entity", put(patch_entity))
-        .route("/hass/rooms", get(get_rooms).post(post_room).delete(delete_room))
+        .route(
+            "/hass/rooms",
+            get(get_rooms).post(post_room).delete(delete_room),
+        )
         .route("/hass/room", put(put_room))
         .route("/hass/logs", get(get_logs))
         .route("/hass/bridge-info", get(get_bridge_info))
@@ -645,7 +661,10 @@ pub fn router() -> Router<AppState> {
         .route("/hass/sync", post(post_sync))
         .route("/hass/apply", post(post_apply))
         .route("/hass/reset-bridge", post(post_reset_bridge))
-        .route("/hass/runtime-config", get(get_runtime_config).put(put_runtime_config))
+        .route(
+            "/hass/runtime-config",
+            get(get_runtime_config).put(put_runtime_config),
+        )
         .route("/hass/token", put(put_token).delete(delete_token))
         .route("/hass/connect", post(post_connect))
         .route("/hass/disconnect", post(post_disconnect))

@@ -129,9 +129,12 @@ fn parse_light_capabilities(state: &HassState) -> HassLightCapabilities {
         .any(|m| matches!(m.as_str(), "xy" | "hs" | "rgb" | "rgbw" | "rgbww"));
     let supports_color_temp = modes.contains("color_temp") || has_color_temp_attr;
     let supports_brightness = has_brightness_attr
-        || modes
-            .iter()
-            .any(|m| matches!(m.as_str(), "brightness" | "xy" | "hs" | "rgb" | "rgbw" | "rgbww" | "color_temp"));
+        || modes.iter().any(|m| {
+            matches!(
+                m.as_str(),
+                "brightness" | "xy" | "hs" | "rgb" | "rgbw" | "rgbww" | "color_temp"
+            )
+        });
 
     HassLightCapabilities {
         supports_brightness,
@@ -356,7 +359,10 @@ fn apply_light_state(light: &mut Light, imported: &ImportedEntity) {
                     light.color = Some(LightColor::new(xy));
                 } else if light.color.is_none() {
                     // Default to D65 white point.
-                    light.color = Some(LightColor::new(XY { x: 0.3127, y: 0.3290 }));
+                    light.color = Some(LightColor::new(XY {
+                        x: 0.3127,
+                        y: 0.3290,
+                    }));
                 }
             } else {
                 light.color = None;
@@ -418,10 +424,17 @@ impl HassBackend {
             HassServiceKind::Motion => RType::Motion.deterministic(format!("{key}:motion")),
             HassServiceKind::Contact => RType::Contact.deterministic(format!("{key}:contact")),
         };
-        (RType::Device.deterministic(format!("{key}:device")), service)
+        (
+            RType::Device.deterministic(format!("{key}:device")),
+            service,
+        )
     }
 
-    pub(super) fn ensure_rooms(&mut self, res: &mut Resources, config: &HassUiConfig) -> ApiResult<()> {
+    pub(super) fn ensure_rooms(
+        &mut self,
+        res: &mut Resources,
+        config: &HassUiConfig,
+    ) -> ApiResult<()> {
         let wanted = config
             .rooms
             .iter()
@@ -450,7 +463,10 @@ impl HassBackend {
                 })?;
             }
 
-            if res.get::<GroupedLight>(&binding.grouped_light_link).is_err() {
+            if res
+                .get::<GroupedLight>(&binding.grouped_light_link)
+                .is_err()
+            {
                 res.add(
                     &binding.grouped_light_link,
                     Resource::GroupedLight(GroupedLight::new(binding.room_link)),
@@ -524,7 +540,10 @@ impl HassBackend {
         }
 
         for room in self.room_map.values() {
-            let children = children_by_room.get(&room.room_id).cloned().unwrap_or_default();
+            let children = children_by_room
+                .get(&room.room_id)
+                .cloned()
+                .unwrap_or_default();
             res.update::<Room>(&room.room_link.rid, |hue_room| {
                 hue_room.metadata.name.clone_from(&room.room_name);
                 hue_room.children = children;
@@ -552,11 +571,10 @@ impl HassBackend {
         imported: &ImportedEntity,
         res: &mut Resources,
     ) -> ApiResult<()> {
-        let (device_link, service_link) = self.links_for_entity(&imported.entity_id, imported.service_kind);
-        let link_zbc = RType::ZigbeeConnectivity.deterministic(format!(
-            "hass:{}:{}:zbc",
-            self.name, imported.entity_id
-        ));
+        let (device_link, service_link) =
+            self.links_for_entity(&imported.entity_id, imported.service_kind);
+        let link_zbc = RType::ZigbeeConnectivity
+            .deterministic(format!("hass:{}:{}:zbc", self.name, imported.entity_id));
         let binding = self
             .entity_map
             .entry(imported.entity_id.clone())
@@ -809,14 +827,17 @@ impl HassBackend {
                     self.name,
                     err
                 );
-                self.ui_log(format!("Area sync fallback (no areas): {err}")).await;
+                self.ui_log(format!("Area sync fallback (no areas): {err}"))
+                    .await;
                 HashMap::new()
             }
         };
 
         let mut parsed = states
             .iter()
-            .filter_map(|state| parse_imported_entity(state, area_map.get(&state.entity_id).cloned()))
+            .filter_map(|state| {
+                parse_imported_entity(state, area_map.get(&state.entity_id).cloned())
+            })
             .collect::<Vec<_>>();
         parsed.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
 
@@ -875,13 +896,16 @@ impl HassBackend {
                 imported.light_archetype = Some(ui_config.light_archetype(&imported.entity_id));
             }
 
-            let detected_sensor_kind = imported.detected_sensor_kind.unwrap_or(HassSensorKind::Ignore);
+            let detected_sensor_kind = imported
+                .detected_sensor_kind
+                .unwrap_or(HassSensorKind::Ignore);
             if matches!(imported.kind, HassEntityKind::BinarySensor) {
-                imported.service_kind = match ui_config.sensor_kind(&imported.entity_id, detected_sensor_kind) {
-                    HassSensorKind::Motion => HassServiceKind::Motion,
-                    HassSensorKind::Contact => HassServiceKind::Contact,
-                    HassSensorKind::Ignore => imported.service_kind,
-                };
+                imported.service_kind =
+                    match ui_config.sensor_kind(&imported.entity_id, detected_sensor_kind) {
+                        HassSensorKind::Motion => HassServiceKind::Motion,
+                        HassSensorKind::Contact => HassServiceKind::Contact,
+                        HassSensorKind::Ignore => imported.service_kind,
+                    };
                 imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
             }
 
@@ -894,9 +918,13 @@ impl HassBackend {
                 HassServiceKind::Light | HassServiceKind::Switch => None,
             };
 
-            let mut included = ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
+            let mut included =
+                ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
             if matches!(imported.kind, HassEntityKind::BinarySensor)
-                && matches!(ui_config.sensor_kind(&imported.entity_id, detected_sensor_kind), HassSensorKind::Ignore)
+                && matches!(
+                    ui_config.sensor_kind(&imported.entity_id, detected_sensor_kind),
+                    HassSensorKind::Ignore
+                )
             {
                 included = false;
             }
@@ -954,8 +982,10 @@ impl HassBackend {
             .collect::<HashSet<_>>();
         let pruned = self.prune_homeassistant_devices(&mut res, &keep_device_rids)?;
         if pruned > 0 {
-            self.ui_log(format!("Pruned {pruned} stale Home Assistant devices from Hue bridge"))
-                .await;
+            self.ui_log(format!(
+                "Pruned {pruned} stale Home Assistant devices from Hue bridge"
+            ))
+            .await;
         }
 
         let stale = self
@@ -998,7 +1028,10 @@ impl HassBackend {
         }
 
         for room in self.room_map.values() {
-            let children = children_by_room.get(&room.room_id).cloned().unwrap_or_default();
+            let children = children_by_room
+                .get(&room.room_id)
+                .cloned()
+                .unwrap_or_default();
             res.update::<Room>(&room.room_link.rid, |hue_room| {
                 hue_room.children = children;
             })?;
@@ -1032,9 +1065,12 @@ impl HassBackend {
 
         let ui_state = self.ui_state.lock().await;
         let ui_config = ui_state.config_normalized();
-        let mut include = ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
+        let mut include =
+            ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
         if matches!(imported.kind, HassEntityKind::BinarySensor) {
-            let detected_sensor_kind = imported.detected_sensor_kind.unwrap_or(HassSensorKind::Ignore);
+            let detected_sensor_kind = imported
+                .detected_sensor_kind
+                .unwrap_or(HassSensorKind::Ignore);
             if matches!(
                 ui_config.sensor_kind(&imported.entity_id, detected_sensor_kind),
                 HassSensorKind::Ignore
@@ -1068,7 +1104,9 @@ impl HassBackend {
             imported.light_archetype = Some(ui_config.light_archetype(&imported.entity_id));
         }
         if matches!(imported.kind, HassEntityKind::BinarySensor) {
-            let detected = imported.detected_sensor_kind.unwrap_or(HassSensorKind::Ignore);
+            let detected = imported
+                .detected_sensor_kind
+                .unwrap_or(HassSensorKind::Ignore);
             imported.service_kind = match ui_config.sensor_kind(&imported.entity_id, detected) {
                 HassSensorKind::Motion => HassServiceKind::Motion,
                 HassSensorKind::Contact => HassServiceKind::Contact,
@@ -1129,9 +1167,13 @@ impl HassBackend {
         let mut include =
             ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
         if matches!(imported.kind, HassEntityKind::BinarySensor) {
-            let detected = imported.detected_sensor_kind.unwrap_or(HassSensorKind::Ignore);
-            if matches!(ui_config.sensor_kind(&imported.entity_id, detected), HassSensorKind::Ignore)
-            {
+            let detected = imported
+                .detected_sensor_kind
+                .unwrap_or(HassSensorKind::Ignore);
+            if matches!(
+                ui_config.sensor_kind(&imported.entity_id, detected),
+                HassSensorKind::Ignore
+            ) {
                 include = false;
             }
         }
@@ -1152,7 +1194,9 @@ impl HassBackend {
             imported.light_archetype = Some(ui_config.light_archetype(&imported.entity_id));
         }
         if matches!(imported.kind, HassEntityKind::BinarySensor) {
-            let detected = imported.detected_sensor_kind.unwrap_or(HassSensorKind::Ignore);
+            let detected = imported
+                .detected_sensor_kind
+                .unwrap_or(HassSensorKind::Ignore);
             imported.service_kind = match ui_config.sensor_kind(&imported.entity_id, detected) {
                 HassSensorKind::Motion => HassServiceKind::Motion,
                 HassSensorKind::Contact => HassServiceKind::Contact,
@@ -1170,10 +1214,8 @@ impl HassBackend {
     }
 
     pub(super) async fn remove_entity_by_id(&mut self, entity_id: &str) -> ApiResult<()> {
-        let device_link = RType::Device.deterministic(format!(
-            "hass:{}:{}:device",
-            self.name, entity_id
-        ));
+        let device_link =
+            RType::Device.deterministic(format!("hass:{}:{}:device", self.name, entity_id));
 
         {
             let mut res = self.state.lock().await;

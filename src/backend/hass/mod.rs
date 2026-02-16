@@ -258,7 +258,8 @@ impl HassBackend {
         match self.client.subscribe_state_changed().await {
             Ok(ws) => {
                 self.ws = Some(ws);
-                self.ui_log("Realtime state sync connected (Home Assistant websocket)").await;
+                self.ui_log("Realtime state sync connected (Home Assistant websocket)")
+                    .await;
             }
             Err(err) => {
                 log::debug!("[{}] WS connect failed: {}", self.name, err);
@@ -268,7 +269,11 @@ impl HassBackend {
 
     async fn event_loop(&mut self, chan: &mut Receiver<Arc<BackendRequest>>) -> ApiResult<()> {
         if let Err(err) = self.run_sync("startup").await {
-            log::error!("[{}] Initial Home Assistant sync failed: {}", self.name, err);
+            log::error!(
+                "[{}] Initial Home Assistant sync failed: {}",
+                self.name,
+                err
+            );
         }
 
         let mut ws_tick = interval(Duration::from_secs(10));
