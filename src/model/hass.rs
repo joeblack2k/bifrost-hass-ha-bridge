@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::fs;
 use std::fs::File;
 
 use camino::Utf8PathBuf;
@@ -883,7 +884,6 @@ pub struct HassUiState {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields)]
 struct HassUiStateFile {
     #[serde(default)]
     config: HassUiConfig,
@@ -891,23 +891,47 @@ struct HassUiStateFile {
     patina: HassPatinaState,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(untagged)]
-enum HassUiStateFileCompat {
-    V2(HassUiStateFile),
-    V1(HassUiConfig),
-}
-
 impl HassUiState {
     pub fn load(file: Utf8PathBuf) -> ApiResult<Self> {
         let (mut config, patina) = if file.is_file() {
-            match File::open(&file).and_then(|fd| {
-                serde_yml::from_reader::<_, HassUiStateFileCompat>(fd).map_err(std::io::Error::other)
-            }) {
-                Ok(HassUiStateFileCompat::V2(state)) => (state.config, state.patina),
-                Ok(HassUiStateFileCompat::V1(config)) => (config, HassPatinaState::default()),
+            match fs::read_to_string(&file) {
+                Ok(raw) => {
+                    let has_v2_shape = serde_yml::from_str::<serde_yml::Value>(&raw)
+                        .ok()
+                        .and_then(|value| value.as_mapping().cloned())
+                        .is_some_and(|mapping| {
+                            mapping.contains_key(serde_yml::Value::from("config"))
+                                || mapping.contains_key(serde_yml::Value::from("patina"))
+                        });
+
+                    if has_v2_shape {
+                        match serde_yml::from_str::<HassUiStateFile>(&raw) {
+                            Ok(state) => (state.config, state.patina),
+                            Err(err) => {
+                                log::warn!(
+                                    "Failed to parse V2 UI state {}, using defaults: {}",
+                                    file,
+                                    err
+                                );
+                                (HassUiConfig::default(), HassPatinaState::default())
+                            }
+                        }
+                    } else {
+                        match serde_yml::from_str::<HassUiConfig>(&raw) {
+                            Ok(config) => (config, HassPatinaState::default()),
+                            Err(err) => {
+                                log::warn!(
+                                    "Failed to parse V1 UI state {}, using defaults: {}",
+                                    file,
+                                    err
+                                );
+                                (HassUiConfig::default(), HassPatinaState::default())
+                            }
+                        }
+                    }
+                }
                 Err(err) => {
-                    log::warn!("Failed to parse {}, using defaults: {}", file, err);
+                    log::warn!("Failed to read {}, using defaults: {}", file, err);
                     (HassUiConfig::default(), HassPatinaState::default())
                 }
             }
