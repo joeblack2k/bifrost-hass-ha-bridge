@@ -1,3 +1,14 @@
+# Deployment
+
+## Docker Compose (GHCR)
+
+Use image:
+
+- `ghcr.io/joeblack2k/bifrost-hass-ha-bridge:latest`
+
+Example compose:
+
+```yaml
 services:
   bifrost-hass:
     image: ghcr.io/joeblack2k/bifrost-hass-ha-bridge:latest
@@ -11,3 +22,13 @@ services:
       - ./hass-ui.yaml:/app/hass-ui.yaml
       - ./hass-runtime.yaml:/app/hass-runtime.yaml
       - ./data:/app/data
+```
+
+## Required files
+
+- `config.yaml`
+- `hass-ui.yaml`
+- `hass-runtime.yaml`
+- `bifrost-hass.env` (contains `HASS_TOKEN`)
+
+See repository README for complete examples.

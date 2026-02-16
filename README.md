@@ -21,14 +21,14 @@ This repository is a Home Assistant focused fork:
 
 Use the prebuilt image from GHCR:
 
-- `ghcr.io/joeblack2k/bifrost-hass:latest`
+- `ghcr.io/joeblack2k/bifrost-hass-ha-bridge:latest`
 
 Create `docker-compose.yaml`:
 
 ```yaml
 services:
   bifrost-hass:
-    image: ghcr.io/joeblack2k/bifrost-hass:latest
+    image: ghcr.io/joeblack2k/bifrost-hass-ha-bridge:latest
     container_name: bifrost-hass
     restart: unless-stopped
     network_mode: host
@@ -106,6 +106,13 @@ docker compose up -d
 Open:
 
 - `http://<bridge-ip>/bifrost/ui`
+
+Wiki pages are stored in-repo:
+
+- [`wiki/Home.md`](wiki/Home.md)
+- [`wiki/Deployment.md`](wiki/Deployment.md)
+- [`wiki/Troubleshooting.md`](wiki/Troubleshooting.md)
+- [`wiki/Sources-and-Credits.md`](wiki/Sources-and-Credits.md)
 
 If you are already familiar with [DiyHue](https://github.com/diyhue/diyHue), you
 might like to read the [comparison with DiyHue](doc/comparison-with-diyhue.md).
