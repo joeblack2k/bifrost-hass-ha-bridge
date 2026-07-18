@@ -60,7 +60,7 @@ impl HassBackend {
 
                 if binding.capabilities.supports_color_temp {
                     if let Some(ct) = upd.color_temperature.and_then(|ct| ct.mirek) {
-                        data.insert("color_temp".to_string(), json!(ct));
+                        data.insert("color_temp_kelvin".to_string(), json!(1_000_000i64 / (ct as i64)));
                     }
                 }
 
