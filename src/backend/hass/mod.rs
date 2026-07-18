@@ -287,7 +287,7 @@ impl HassBackend {
                     }
                     req = chan.recv() => {
                         let req = req?;
-                        self.handle_backend_event(req).await?;
+                        if let Err(err) = self.handle_backend_event(req).await { log::error!("[{}] backend event failed: {}", self.name, err); }
                     }
                     ev = ws.next_state_changed() => {
                         match ev {
@@ -318,7 +318,7 @@ impl HassBackend {
                     }
                     req = chan.recv() => {
                         let req = req?;
-                        self.handle_backend_event(req).await?;
+                        if let Err(err) = self.handle_backend_event(req).await { log::error!("[{}] backend event failed: {}", self.name, err); }
                     }
                 }
             }
