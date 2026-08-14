@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use serde_yml::Value;
 use uuid::Uuid;
 
@@ -32,6 +33,10 @@ pub struct LegacyResourceLink {
 pub struct LegacyState {
     #[serde(default)]
     pub resource_links: BTreeMap<u32, LegacyResourceLink>,
+    #[serde(default)]
+    pub rules: BTreeMap<u32, JsonValue>,
+    #[serde(default)]
+    pub schedules: BTreeMap<u32, JsonValue>,
 }
 
 impl AuxData {

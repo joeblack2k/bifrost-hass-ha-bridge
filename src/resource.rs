@@ -13,10 +13,11 @@ use uuid::Uuid;
 
 use bifrost_api::backend::BackendRequest;
 use hue::api::{
-    Bridge, BridgeHome, Device, DeviceArchetype, DeviceProductData, DimmingUpdate, Entertainment,
-    EntertainmentConfiguration, GroupedLight, Light, Metadata, On, RType, Resource, ResourceLink,
-    ResourceRecord, Room, Stub, TimeZone, ZigbeeConnectivity, ZigbeeConnectivityStatus,
-    ZigbeeDeviceDiscovery, ZigbeeDeviceDiscoveryAction, ZigbeeDeviceDiscoveryStatus, Zone,
+    BehaviorScript, Bridge, BridgeHome, Device, DeviceArchetype, DeviceProductData, DimmingUpdate,
+    Entertainment, EntertainmentConfiguration, GroupedLight, Light, Metadata, On, RType, Resource,
+    ResourceLink, ResourceRecord, Room, Stub, TimeZone, ZigbeeConnectivity,
+    ZigbeeConnectivityStatus, ZigbeeDeviceDiscovery, ZigbeeDeviceDiscoveryAction,
+    ZigbeeDeviceDiscoveryStatus, Zone,
 };
 use hue::api::{InternetConnectivity, InternetConnectivityStatus};
 use hue::error::{HueError, HueResult};
@@ -133,6 +134,14 @@ impl Resources {
             Ok(())
         })?;
 
+        let link_wake_up = RType::BehaviorScript.link_to(BehaviorScript::WAKE_UP_ID);
+        if self.state.try_get(&link_wake_up.rid).is_none() {
+            self.add(
+                &link_wake_up,
+                Resource::BehaviorScript(BehaviorScript::wake_up()),
+            )?;
+        }
+
         Ok(())
     }
 
@@ -172,6 +181,60 @@ impl Resources {
 
     pub fn delete_legacy_resource_link(&mut self, id: u32) -> bool {
         let removed = self.state.legacy.resource_links.remove(&id).is_some();
+        if removed {
+            self.state_updates.notify_one();
+        }
+        removed
+    }
+
+    #[must_use]
+    pub fn legacy_rules(&self) -> BTreeMap<u32, Value> {
+        self.state.legacy.rules.clone()
+    }
+
+    #[must_use]
+    pub fn legacy_rule(&self, id: u32) -> Option<Value> {
+        self.state.legacy.rules.get(&id).cloned()
+    }
+
+    pub fn next_legacy_rule_id(&self) -> ApiResult<u32> {
+        next_legacy_id(&self.state.legacy.rules)
+    }
+
+    pub fn put_legacy_rule(&mut self, id: u32, rule: Value) {
+        self.state.legacy.rules.insert(id, rule);
+        self.state_updates.notify_one();
+    }
+
+    pub fn delete_legacy_rule(&mut self, id: u32) -> bool {
+        let removed = self.state.legacy.rules.remove(&id).is_some();
+        if removed {
+            self.state_updates.notify_one();
+        }
+        removed
+    }
+
+    #[must_use]
+    pub fn legacy_schedules(&self) -> BTreeMap<u32, Value> {
+        self.state.legacy.schedules.clone()
+    }
+
+    #[must_use]
+    pub fn legacy_schedule(&self, id: u32) -> Option<Value> {
+        self.state.legacy.schedules.get(&id).cloned()
+    }
+
+    pub fn next_legacy_schedule_id(&self) -> ApiResult<u32> {
+        next_legacy_id(&self.state.legacy.schedules)
+    }
+
+    pub fn put_legacy_schedule(&mut self, id: u32, schedule: Value) {
+        self.state.legacy.schedules.insert(id, schedule);
+        self.state_updates.notify_one();
+    }
+
+    pub fn delete_legacy_schedule(&mut self, id: u32) -> bool {
+        let removed = self.state.legacy.schedules.remove(&id).is_some();
         if removed {
             self.state_updates.notify_one();
         }
@@ -714,4 +777,14 @@ impl Resources {
 
         Ok(())
     }
+}
+
+fn next_legacy_id<T>(items: &BTreeMap<u32, T>) -> ApiResult<u32> {
+    let mut id = 1;
+    while items.contains_key(&id) {
+        id = id
+            .checked_add(1)
+            .ok_or_else(|| crate::error::ApiError::service_error("legacy ID space is full"))?;
+    }
+    Ok(id)
 }

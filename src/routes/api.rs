@@ -32,6 +32,7 @@ use crate::resource::Resources;
 use crate::routes::auth::{STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY};
 use crate::routes::clip::entertainment_configuration::{self, POSITIONS};
 use crate::routes::extractor::Json;
+use crate::routes::v1_automations;
 use crate::routes::v1_resource_links;
 use crate::routes::v1_sensors;
 use crate::routes::{ApiV1Error, ApiV1Result};
@@ -233,9 +234,9 @@ async fn get_api_user(
         groups: get_groups(&lock, false)?,
         lights: get_lights(&lock)?,
         resourcelinks: v1_resource_links::get(&lock),
-        rules: HashMap::new(),
+        rules: v1_automations::get_rules(&lock)?,
         scenes: get_scenes(&username, &lock)?,
-        schedules: HashMap::new(),
+        schedules: v1_automations::get_schedules(&lock)?,
         sensors: v1_sensors::get_sensors(&lock)?,
     }))
 }
@@ -251,7 +252,8 @@ async fn get_api_user_resource(
         ApiResourceType::Groups => Ok(Json(json!(get_groups(lock, false)?))),
         ApiResourceType::Scenes => Ok(Json(json!(get_scenes(&username, lock)?))),
         ApiResourceType::Resourcelinks => Ok(Json(json!(v1_resource_links::get(lock)))),
-        ApiResourceType::Rules | ApiResourceType::Schedules => Ok(Json(json!({}))),
+        ApiResourceType::Rules => Ok(Json(json!(v1_automations::get_rules(lock)?))),
+        ApiResourceType::Schedules => Ok(Json(json!(v1_automations::get_schedules(lock)?))),
         ApiResourceType::Sensors => Ok(Json(json!(v1_sensors::get_sensors(lock)?))),
         ApiResourceType::Capabilities => Ok(Json(json!(Capabilities::new()))),
     }
@@ -295,6 +297,18 @@ async fn post_api_user_resource(
         let link: ApiResourceLink = serde_json::from_value(req)?;
         let mut lock = state.res.lock().await;
         let id = v1_resource_links::create(&mut lock, link)?;
+        return Ok(Json(json!([{"success": {"id": id}}])));
+    }
+
+    if matches!(&resource, ApiResourceType::Rules) {
+        let mut lock = state.res.lock().await;
+        let id = v1_automations::create_rule(&mut lock, req)?;
+        return Ok(Json(json!([{"success": {"id": id}}])));
+    }
+
+    if matches!(&resource, ApiResourceType::Schedules) {
+        let mut lock = state.res.lock().await;
+        let id = v1_automations::create_schedule(&mut lock, req)?;
         return Ok(Json(json!([{"success": {"id": id}}])));
     }
 
@@ -385,6 +399,14 @@ async fn get_api_user_resource_id(
             let lock = state.res.lock().await;
             json!(v1_resource_links::get_one(&lock, id)?)
         }
+        ApiResourceType::Rules => {
+            let lock = state.res.lock().await;
+            json!(v1_automations::get_rule(&lock, id)?)
+        }
+        ApiResourceType::Schedules => {
+            let lock = state.res.lock().await;
+            json!(v1_automations::get_schedule(&lock, id)?)
+        }
         ApiResourceType::Groups => {
             let lock = state.res.lock().await;
             let groups = get_groups(&lock, true)?;
@@ -461,11 +483,23 @@ async fn put_api_user_resource_id(
                 "success": {format!("/resourcelinks/{id}"): id}
             }])))
         }
+        ApiResourceType::Rules => {
+            let mut lock = state.res.lock().await;
+            v1_automations::update_rule(&mut lock, id, req)?;
+            Ok(Json(json!([{
+                "success": {format!("/rules/{id}"): id}
+            }])))
+        }
+        ApiResourceType::Schedules => {
+            let mut lock = state.res.lock().await;
+            v1_automations::update_schedule(&mut lock, id, req)?;
+            Ok(Json(json!([{
+                "success": {format!("/schedules/{id}"): id}
+            }])))
+        }
         ApiResourceType::Config
         | ApiResourceType::Lights
-        | ApiResourceType::Rules
         | ApiResourceType::Scenes
-        | ApiResourceType::Schedules
         | ApiResourceType::Sensors
         | ApiResourceType::Capabilities => Err(ApiV1Error::V1CreateUnsupported(artype)),
     }
@@ -587,14 +621,21 @@ async fn delete_api_user_resource_id(
     State(state): State<AppState>,
     Path((_username, resource, id)): Path<(String, ApiResourceType, u32)>,
 ) -> ApiV1Result<Json<Value>> {
-    if !matches!(resource, ApiResourceType::Resourcelinks) {
-        return Err(ApiV1Error::V1CreateUnsupported(resource));
-    }
-
     let mut lock = state.res.lock().await;
-    v1_resource_links::delete(&mut lock, id)?;
+    match &resource {
+        ApiResourceType::Resourcelinks => v1_resource_links::delete(&mut lock, id)?,
+        ApiResourceType::Rules => v1_automations::delete_rule(&mut lock, id)?,
+        ApiResourceType::Schedules => v1_automations::delete_schedule(&mut lock, id)?,
+        _ => return Err(ApiV1Error::V1CreateUnsupported(resource)),
+    }
+    let path = match &resource {
+        ApiResourceType::Resourcelinks => "resourcelinks",
+        ApiResourceType::Rules => "rules",
+        ApiResourceType::Schedules => "schedules",
+        _ => unreachable!("unsupported resource returned from delete match"),
+    };
     Ok(Json(json!([{
-        "success": {format!("/resourcelinks/{id}"): id}
+        "success": {format!("/{path}/{id}"): id}
     }])))
 }
 
