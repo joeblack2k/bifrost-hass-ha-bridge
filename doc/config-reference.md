@@ -23,12 +23,13 @@ bifrost:
   cert_file: "cert.pem"
 
   # name of yaml file used by /bifrost/ui
-  # to store Home Assistant filtering preferences
-  hass_ui_file: "hass-ui.yaml"
+  # to store persistent Home Assistant bridge settings
+  # (use the durable data directory in native/container deployments)
+  hass_ui_file: "data/hass-ui.yaml"
 
   # name of yaml file used by /bifrost/ui
   # to store runtime Home Assistant URL/token settings
-  hass_runtime_file: "hass-runtime.yaml"
+  hass_runtime_file: "data/hass-runtime.yaml"
 
 # Bridge section
 #

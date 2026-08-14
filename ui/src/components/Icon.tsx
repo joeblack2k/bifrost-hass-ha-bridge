@@ -8,6 +8,7 @@ export type IconName =
   | 'chevron-right'
   | 'circle'
   | 'cloud'
+  | 'download'
   | 'grid'
   | 'lamp'
   | 'layers'
@@ -25,6 +26,7 @@ export type IconName =
   | 'spark'
   | 'square'
   | 'trash'
+  | 'upload'
   | 'x'
 
 export function Icon({ name, size = 18, ...props }: { name: IconName; size?: number } & SVGProps<SVGSVGElement>) {
@@ -58,6 +60,9 @@ export function Icon({ name, size = 18, ...props }: { name: IconName; size?: num
       break
     case 'cloud':
       content = <path d="M7.5 18h9.75a4.75 4.75 0 0 0 .5-9.47A6.25 6.25 0 0 0 5.8 10.9 3.6 3.6 0 0 0 7.5 18Z" />
+      break
+    case 'download':
+      content = <><path d="M12 4v11m-4-4 4 4 4-4" /><path d="M5 20h14" /></>
       break
     case 'grid':
       content = <><rect x="4" y="4" width="6" height="6" rx="1" /><rect x="14" y="4" width="6" height="6" rx="1" /><rect x="4" y="14" width="6" height="6" rx="1" /><rect x="14" y="14" width="6" height="6" rx="1" /></>
@@ -109,6 +114,9 @@ export function Icon({ name, size = 18, ...props }: { name: IconName; size?: num
       break
     case 'trash':
       content = <><path d="M5 7h14M10 11v5M14 11v5M8 7l1-3h6l1 3m-9 0 1 13h10l1-13" /></>
+      break
+    case 'upload':
+      content = <><path d="M12 20V9m-4 4 4-4 4 4" /><path d="M5 4h14" /></>
       break
     case 'x':
       content = <path d="m6 6 12 12M18 6 6 18" />

@@ -77,9 +77,14 @@ impl AppState {
         res.reset_all_streaming()?;
         res.ensure_core_bridge_resources(&hue::bridge_id(config.bridge.mac))?;
 
-        let hass_ui = Arc::new(Mutex::new(HassUiState::load(
-            config.bifrost.hass_ui_file.clone(),
-        )?));
+        let hass_ui_state = HassUiState::load(config.bifrost.hass_ui_file.clone())?;
+        log::info!(
+            "Loaded Bifrost bridge settings from {} ({} rooms, {} entity preferences)",
+            hass_ui_state.file,
+            hass_ui_state.config.rooms.len(),
+            hass_ui_state.config.entity_preferences.len()
+        );
+        let hass_ui = Arc::new(Mutex::new(hass_ui_state));
         let fallback_hass_url = config
             .hass
             .servers

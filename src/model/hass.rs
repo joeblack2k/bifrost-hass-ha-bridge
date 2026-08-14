@@ -743,6 +743,9 @@ impl Default for HassRuntimeConfig {
 }
 
 fn atomic_write(path: &Utf8PathBuf, contents: &[u8]) -> ApiResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut temp_path = path.clone();
     temp_path.set_file_name(format!(
         ".{}.{}.tmp",
@@ -782,6 +785,15 @@ fn atomic_write(path: &Utf8PathBuf, contents: &[u8]) -> ApiResult<()> {
         let _ = fs::remove_file(&temp_path);
     }
     result
+}
+
+fn backup_path(path: &Utf8PathBuf) -> Utf8PathBuf {
+    let mut backup = path.clone();
+    backup.set_file_name(format!(
+        "{}.bak",
+        path.file_name().unwrap_or("bifrost-settings")
+    ));
+    backup
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1043,52 +1055,57 @@ struct HassUiStateFile {
     patina: HassPatinaState,
 }
 
+fn parse_ui_state_file(raw: &str) -> ApiResult<(HassUiConfig, HassPatinaState)> {
+    let has_v2_shape = serde_yml::from_str::<serde_yml::Value>(raw)
+        .ok()
+        .and_then(|value| value.as_mapping().cloned())
+        .is_some_and(|mapping| {
+            mapping.contains_key(serde_yml::Value::from("config"))
+                || mapping.contains_key(serde_yml::Value::from("patina"))
+        });
+
+    if has_v2_shape {
+        let state = serde_yml::from_str::<HassUiStateFile>(raw)?;
+        Ok((state.config, state.patina))
+    } else {
+        let config = serde_yml::from_str::<HassUiConfig>(raw)?;
+        Ok((config, HassPatinaState::default()))
+    }
+}
+
 impl HassUiState {
     pub fn load(file: Utf8PathBuf) -> ApiResult<Self> {
-        let (mut config, patina) = if file.is_file() {
-            match fs::read_to_string(&file) {
-                Ok(raw) => {
-                    let has_v2_shape = serde_yml::from_str::<serde_yml::Value>(&raw)
-                        .ok()
-                        .and_then(|value| value.as_mapping().cloned())
-                        .is_some_and(|mapping| {
-                            mapping.contains_key(serde_yml::Value::from("config"))
-                                || mapping.contains_key(serde_yml::Value::from("patina"))
-                        });
-
-                    if has_v2_shape {
-                        match serde_yml::from_str::<HassUiStateFile>(&raw) {
-                            Ok(state) => (state.config, state.patina),
-                            Err(err) => {
-                                log::warn!(
-                                    "Failed to parse V2 UI state {}, using defaults: {}",
-                                    file,
-                                    err
-                                );
-                                (HassUiConfig::default(), HassPatinaState::default())
-                            }
-                        }
-                    } else {
-                        match serde_yml::from_str::<HassUiConfig>(&raw) {
-                            Ok(config) => (config, HassPatinaState::default()),
-                            Err(err) => {
-                                log::warn!(
-                                    "Failed to parse V1 UI state {}, using defaults: {}",
-                                    file,
-                                    err
-                                );
-                                (HassUiConfig::default(), HassPatinaState::default())
-                            }
-                        }
+        let (mut config, patina, recovered_from_backup) = if file.is_file() {
+            let raw = fs::read_to_string(&file)?;
+            match parse_ui_state_file(&raw) {
+                Ok((config, patina)) => (config, patina, false),
+                Err(primary_err) => {
+                    let backup = backup_path(&file);
+                    if !backup.is_file() {
+                        return Err(ApiError::service_error(format!(
+                            "Failed to parse bridge settings {}: {primary_err}",
+                            file
+                        )));
                     }
-                }
-                Err(err) => {
-                    log::warn!("Failed to read {}, using defaults: {}", file, err);
-                    (HassUiConfig::default(), HassPatinaState::default())
+
+                    let backup_raw = fs::read_to_string(&backup)?;
+                    let (config, patina) = parse_ui_state_file(&backup_raw).map_err(|backup_err| {
+                        ApiError::service_error(format!(
+                            "Failed to parse bridge settings {} ({primary_err}) and backup {} ({backup_err})",
+                            file, backup
+                        ))
+                    })?;
+                    log::warn!(
+                        "Recovered bridge settings from {} because {} could not be parsed: {}",
+                        backup,
+                        file,
+                        primary_err
+                    );
+                    (config, patina, true)
                 }
             }
         } else {
-            (HassUiConfig::default(), HassPatinaState::default())
+            (HassUiConfig::default(), HassPatinaState::default(), false)
         };
         config.normalize();
 
@@ -1101,7 +1118,7 @@ impl HassUiState {
             sync: HassSyncStatus::default(),
         };
 
-        if !state.file.is_file() {
+        if recovered_from_backup || !state.file.is_file() {
             state.save_config()?;
         }
 
@@ -1123,6 +1140,15 @@ impl HassUiState {
             patina,
         };
         let yaml = serde_yml::to_string(&state)?;
+
+        // Keep the last known-good settings beside the canonical file. The backup is written
+        // before the replacement, so a failed new write never destroys the previous snapshot.
+        if self.file.is_file() {
+            let previous = fs::read_to_string(&self.file)?;
+            if parse_ui_state_file(&previous).is_ok() {
+                atomic_write(&backup_path(&self.file), previous.as_bytes())?;
+            }
+        }
         atomic_write(&self.file, yaml.as_bytes())
     }
 
@@ -1470,6 +1496,7 @@ mod atomic_save_tests {
     use super::{
         HassEntityPreference, HassFakeCloudMode, HassPatinaState, HassRuntimeConfig,
         HassRuntimeState, HassSyncStatus, HassUiConfig, HassUiState, HassUiStateFile,
+        parse_ui_state_file,
     };
     use camino::Utf8PathBuf;
     use std::collections::HashMap;
@@ -1638,6 +1665,80 @@ mod atomic_save_tests {
         dir.assert_no_temp_files();
         #[cfg(unix)]
         assert_private(&state.file);
+    }
+
+    #[test]
+    fn ui_save_keeps_previous_settings_in_a_private_backup() {
+        let dir = TestDir::new();
+        let file = dir.file("hass-ui.yaml");
+        let mut state = HassUiState {
+            file: file.clone(),
+            config: HassUiConfig::default(),
+            patina: HassPatinaState::default(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+        state.config.rooms.push(super::HassRoomConfig {
+            id: "first".to_string(),
+            name: "First".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        state.save_config().expect("first settings should save");
+
+        state.config.rooms.push(super::HassRoomConfig {
+            id: "second".to_string(),
+            name: "Second".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        state.save_config().expect("second settings should save");
+
+        let backup = dir.file("hass-ui.yaml.bak");
+        let stored: HassUiStateFile =
+            serde_yml::from_str(&fs::read_to_string(&backup).expect("backup should exist"))
+                .expect("backup should be valid YAML");
+        assert!(stored.config.rooms.iter().any(|room| room.id == "first"));
+        assert!(!stored.config.rooms.iter().any(|room| room.id == "second"));
+        #[cfg(unix)]
+        assert_private(&backup);
+    }
+
+    #[test]
+    fn ui_load_recovers_from_backup_but_fails_closed_without_one() {
+        let dir = TestDir::new();
+        let file = dir.file("hass-ui.yaml");
+        let state = HassUiState {
+            file: file.clone(),
+            config: HassUiConfig::default(),
+            patina: HassPatinaState::default(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+        state.save_config().expect("initial settings should save");
+        let mut changed = state.clone();
+        changed.config.rooms.push(super::HassRoomConfig {
+            id: "office".to_string(),
+            name: "Office".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        changed.save_config().expect("changed settings should save");
+
+        fs::write(&file, b"not: [valid").expect("canonical settings should be corruptible");
+        let recovered = HassUiState::load(file.clone()).expect("backup should recover settings");
+        assert_eq!(recovered.config.rooms, state.config.rooms);
+        assert!(
+            parse_ui_state_file(&fs::read_to_string(&file).expect("settings should be repaired"))
+                .is_ok()
+        );
+
+        fs::write(dir.file("hass-ui.yaml.bak"), b"also: [not valid")
+            .expect("backup should be corruptible");
+        fs::write(&file, b"still: [not valid").expect("canonical settings should be corruptible");
+        assert!(HassUiState::load(file).is_err());
     }
 }
 

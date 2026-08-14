@@ -1,8 +1,8 @@
 bifrost:
   # Override the default path to the one used in the docker image
   cert_file: "certs/cert.pem"
-  hass_ui_file: "hass-ui.yaml"
-  hass_runtime_file: "hass-runtime.yaml"
+  hass_ui_file: "data/hass-ui.yaml"
+  hass_runtime_file: "data/hass-runtime.yaml"
 
 bridge:
   name: Bifrost
