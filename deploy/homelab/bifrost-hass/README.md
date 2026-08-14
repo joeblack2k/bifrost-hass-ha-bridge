@@ -5,9 +5,11 @@
 - `compose.yaml`: main service + `macvlan_network` static IP (`192.168.2.6`)
 - `compose.override.yaml`: local resource limits
 - `config.yaml`: bridge + Home Assistant backend config
-- `hass-ui.yaml`: UI filter defaults
 - `bifrost-hass.env.example`: env template (`HASS_TOKEN`)
-- `data/`: persistent state + generated certificate files
+- `data/`: persistent bridge settings, runtime state and generated certificate files
+
+The native settings loader also migrates valid legacy root-level `hass-ui.yaml` and
+`hass-runtime.yaml` files into `data/` when the new files do not exist; the legacy files are kept.
 
 ## Deploy
 

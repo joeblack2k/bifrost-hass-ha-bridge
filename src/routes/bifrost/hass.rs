@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,16 +8,15 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use bifrost_api::backend::BackendRequest;
-use hue::api::{Device, RType};
+use hyper::StatusCode;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::model::hass::{
-    HassApplyResponse, HassBridgeInfo, HassConnectResponse, HassEntitiesResponse,
-    HassEntityPatchRequest, HassLinkButtonResponse, HassLogsResponse, HassPatinaEventRequest,
-    HassPatinaPublic, HassResetBridgeResponse, HassRoomCreateRequest, HassRoomDeleteRequest,
-    HassRoomRenameRequest, HassRoomsResponse, HassRuntimeConfigPublic, HassRuntimeConfigUpdate,
-    HassSensorKind, HassSwitchMode, HassSyncResponse, HassTokenRequest, HassUiConfig,
-    HassUiPayload,
+    HassBridgeInfo, HassConnectResponse, HassEntitiesResponse, HassEntityPatchRequest,
+    HassLinkButtonResponse, HassLogsResponse, HassPatinaEventRequest, HassPatinaPublic,
+    HassResetBridgeResponse, HassRoomCreateRequest, HassRoomDeleteRequest, HassRoomRenameRequest,
+    HassRoomsResponse, HassRuntimeConfigPublic, HassRuntimeConfigUpdate, HassSensorKind,
+    HassSwitchMode, HassSyncResponse, HassTokenRequest, HassUiConfig, HassUiPayload,
 };
 use crate::routes::bifrost::BifrostApiResult;
 use crate::routes::extractor::Json;
@@ -422,87 +420,33 @@ async fn post_linkbutton(
     }))
 }
 
-async fn post_sync(State(state): State<AppState>) -> BifrostApiResult<Json<HassSyncResponse>> {
+async fn post_sync(
+    State(state): State<AppState>,
+) -> BifrostApiResult<(StatusCode, Json<HassSyncResponse>)> {
     {
         let res = state.res.lock().await;
         res.backend_request(BackendRequest::HassSync)?;
     }
     let sync = state.hass_ui().lock().await.sync.clone();
-    Ok(Json(HassSyncResponse { queued: true, sync }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassSyncResponse { queued: true, sync }),
+    ))
 }
 
-async fn post_apply(State(state): State<AppState>) -> BifrostApiResult<Json<HassApplyResponse>> {
-    let (cfg, entities) = {
-        let ui = state.hass_ui();
-        let lock = ui.lock().await;
-        (lock.config_normalized(), lock.entities.clone())
-    };
-
-    let backend_name = state
-        .config()
-        .hass
-        .servers
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "homeassistant".to_string());
-
-    let mut keep_device_rids = HashSet::new();
-    for ent in &entities {
-        let mut include = cfg.should_include(&ent.entity_id, &ent.name, ent.available);
-        if ent.domain == "binary_sensor" {
-            let detected = ent.sensor_kind.unwrap_or(HassSensorKind::Ignore);
-            if matches!(
-                cfg.sensor_kind(&ent.entity_id, detected),
-                HassSensorKind::Ignore
-            ) {
-                include = false;
-            }
-        }
-
-        if include {
-            let link = RType::Device
-                .deterministic(format!("hass:{}:{}:device", backend_name, ent.entity_id));
-            keep_device_rids.insert(link.rid);
-        }
-    }
-
-    let removed_devices = {
-        let mut removed = 0_usize;
-        let mut res = state.res.lock().await;
-        let device_ids = res.get_resource_ids_by_type(RType::Device);
-        for rid in device_ids {
-            if keep_device_rids.contains(&rid) {
-                continue;
-            }
-            let Ok(dev) = res.get_id::<Device>(rid) else {
-                continue;
-            };
-            if dev.product_data.manufacturer_name != "Home Assistant" {
-                continue;
-            }
-            if !dev.product_data.model_id.starts_with("hass-") {
-                continue;
-            }
-            if res.delete(&RType::Device.link_to(rid)).is_ok() {
-                removed += 1;
-            }
-        }
-        removed
-    };
-
+async fn post_apply(
+    State(state): State<AppState>,
+) -> BifrostApiResult<(StatusCode, Json<HassSyncResponse>)> {
     {
-        let ui = state.hass_ui();
-        let mut lock = ui.lock().await;
-        lock.push_log(format!(
-            "Applied selection to Hue bridge (removed {removed_devices} devices)"
-        ));
+        let res = state.res.lock().await;
+        res.backend_request(BackendRequest::HassSync)?;
     }
+    let sync = state.hass_ui().lock().await.sync.clone();
 
-    Ok(Json(HassApplyResponse {
-        applied: true,
-        removed_devices,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassSyncResponse { queued: true, sync }),
+    ))
 }
 
 async fn post_reset_bridge(
@@ -540,7 +484,7 @@ async fn put_runtime_config(
     let config = {
         let runtime = state.hass_runtime();
         let mut lock = runtime.lock().await;
-        lock.set_config_update(update);
+        lock.set_config_update(update)?;
         lock.save()?;
         lock.public_config()
     };
@@ -586,7 +530,7 @@ async fn delete_token(
 
 async fn post_connect(
     State(state): State<AppState>,
-) -> BifrostApiResult<Json<HassConnectResponse>> {
+) -> BifrostApiResult<(StatusCode, Json<HassConnectResponse>)> {
     let runtime_cfg = {
         let runtime = state.hass_runtime();
         let mut lock = runtime.lock().await;
@@ -599,15 +543,19 @@ async fn post_connect(
         res.backend_request(BackendRequest::HassConnect)?;
     }
 
-    Ok(Json(HassConnectResponse {
-        connected: true,
-        runtime: runtime_cfg,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassConnectResponse {
+            queued: true,
+            enabled: true,
+            runtime: runtime_cfg,
+        }),
+    ))
 }
 
 async fn post_disconnect(
     State(state): State<AppState>,
-) -> BifrostApiResult<Json<HassConnectResponse>> {
+) -> BifrostApiResult<(StatusCode, Json<HassConnectResponse>)> {
     let runtime_cfg = {
         let runtime = state.hass_runtime();
         let mut lock = runtime.lock().await;
@@ -620,10 +568,14 @@ async fn post_disconnect(
         res.backend_request(BackendRequest::HassDisconnect)?;
     }
 
-    Ok(Json(HassConnectResponse {
-        connected: false,
-        runtime: runtime_cfg,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassConnectResponse {
+            queued: true,
+            enabled: false,
+            runtime: runtime_cfg,
+        }),
+    ))
 }
 
 async fn get_patina(State(state): State<AppState>) -> BifrostApiResult<Json<HassPatinaPublic>> {

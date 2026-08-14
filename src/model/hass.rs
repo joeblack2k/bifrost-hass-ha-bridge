@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::File;
+use std::io::{Error, ErrorKind, Write};
 
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
+use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 
@@ -184,6 +186,61 @@ pub struct HassUiConfig {
     pub hass_lat: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hass_long: Option<String>,
+}
+
+const HASS_UI_CONFIG_FIELDS: &[&str] = &[
+    "hidden_entity_ids",
+    "exclude_entity_ids",
+    "exclude_name_patterns",
+    "include_unavailable",
+    "rooms",
+    "entity_preferences",
+    "ignored_area_names",
+    "default_add_new_devices_to_hue",
+    "sync_hass_areas_to_rooms",
+    "fake_cloud_mode",
+    "fake_cloud_custom",
+    "hass_timezone",
+    "hass_lat",
+    "hass_long",
+];
+
+const REQUIRED_HASS_UI_CONFIG_FIELDS: &[&str] = &[
+    "hidden_entity_ids",
+    "exclude_entity_ids",
+    "exclude_name_patterns",
+    "include_unavailable",
+    "rooms",
+    "entity_preferences",
+    "ignored_area_names",
+    "default_add_new_devices_to_hue",
+    "sync_hass_areas_to_rooms",
+    "fake_cloud_mode",
+    "fake_cloud_custom",
+];
+
+pub(crate) fn validate_hass_ui_config_fields<'a, I>(fields: I) -> ApiResult<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let fields = fields.into_iter().collect::<BTreeSet<_>>();
+    if let Some(field) = fields
+        .iter()
+        .find(|field| !HASS_UI_CONFIG_FIELDS.contains(*field))
+    {
+        return Err(ApiError::service_error(format!(
+            "Bridge settings config contains unknown field: {field}"
+        )));
+    }
+    if let Some(field) = REQUIRED_HASS_UI_CONFIG_FIELDS
+        .iter()
+        .find(|field| !fields.contains(*field))
+    {
+        return Err(ApiError::service_error(format!(
+            "Bridge settings config is missing required field: {field}"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for HassUiConfig {
@@ -740,6 +797,82 @@ impl Default for HassRuntimeConfig {
     }
 }
 
+fn atomic_write(path: &Utf8PathBuf, contents: &[u8]) -> ApiResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut temp_path = path.clone();
+    temp_path.set_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or("bifrost"),
+        Uuid::new_v4()
+    ));
+
+    let mut temp_created = false;
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&temp_path)?;
+        temp_created = true;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+
+        Ok(())
+    })();
+
+    if temp_created && result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn legacy_data_file(file: &Utf8PathBuf) -> Option<Utf8PathBuf> {
+    let name = file.file_name()?;
+    if !matches!(name, "hass-ui.yaml" | "hass-runtime.yaml") {
+        return None;
+    }
+    let parent = file.parent()?;
+    if parent.file_name()? != "data" {
+        return None;
+    }
+    Some(parent.parent()?.join(name))
+}
+
+fn read_utf8_file(file: &Utf8PathBuf) -> Result<String, Error> {
+    let bytes = fs::read(file)?;
+    String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid UTF-8 in bridge settings file {file}"),
+        )
+    })
+}
+
+fn backup_path(path: &Utf8PathBuf) -> Utf8PathBuf {
+    let mut backup = path.clone();
+    backup.set_file_name(format!(
+        "{}.bak",
+        path.file_name().unwrap_or("bifrost-settings")
+    ));
+    backup
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HassRuntimeConfigPublic {
     pub enabled: bool,
@@ -769,18 +902,18 @@ pub struct HassRuntimeState {
 
 impl HassRuntimeState {
     pub fn load(file: Utf8PathBuf, fallback_url: Option<String>) -> ApiResult<Self> {
-        let mut config = if file.is_file() {
-            match File::open(&file).and_then(|fd| {
-                serde_yml::from_reader::<_, HassRuntimeConfig>(fd).map_err(std::io::Error::other)
-            }) {
-                Ok(config) => config,
-                Err(err) => {
-                    log::warn!("Failed to parse {}, using defaults: {}", file, err);
-                    HassRuntimeConfig::default()
-                }
-            }
+        let (mut config, migrated_from_legacy) = if file.is_file() {
+            (serde_yml::from_reader(File::open(&file)?)?, false)
+        } else if let Some(legacy) = legacy_data_file(&file).filter(|path| path.is_file()) {
+            let config = serde_yml::from_reader(File::open(&legacy)?)?;
+            log::warn!(
+                "Migrating legacy Home Assistant runtime settings from {} to {}",
+                legacy,
+                file
+            );
+            (config, true)
         } else {
-            HassRuntimeConfig::default()
+            (HassRuntimeConfig::default(), false)
         };
 
         if config.url.trim().is_empty() {
@@ -795,16 +928,15 @@ impl HassRuntimeState {
         }
 
         let state = Self { file, config };
-        if !state.file.is_file() {
+        if migrated_from_legacy || !state.file.is_file() {
             state.save()?;
         }
         Ok(state)
     }
 
     pub fn save(&self) -> ApiResult<()> {
-        let file = File::create(&self.file)?;
-        serde_yml::to_writer(file, &self.config)?;
-        Ok(())
+        let yaml = serde_yml::to_string(&self.config)?;
+        atomic_write(&self.file, yaml.as_bytes())
     }
 
     pub fn public_config(&self) -> HassRuntimeConfigPublic {
@@ -820,9 +952,14 @@ impl HassRuntimeState {
         }
     }
 
-    pub fn set_config_update(&mut self, update: HassRuntimeConfigUpdate) {
+    pub fn set_config_update(&mut self, update: HassRuntimeConfigUpdate) -> ApiResult<()> {
+        let url = Self::parse_url(&update.url)?;
+        let previous_url = Self::parse_url(&self.config.url).ok();
+        let origin_changed =
+            previous_url.is_none_or(|previous| !Self::same_origin(&previous, &url));
+
         self.config.enabled = update.enabled;
-        self.config.url = update.url.trim().to_string();
+        self.config.url = url.to_string();
         self.config.sync_mode = if update
             .sync_mode
             .as_ref()
@@ -836,6 +973,13 @@ impl HassRuntimeState {
                 .map(|x| x.trim().to_string())
                 .unwrap_or_else(|| "manual".to_string())
         };
+
+        // A runtime URL change must not reuse a token against another HA origin.
+        if origin_changed {
+            self.clear_token();
+        }
+
+        Ok(())
     }
 
     pub fn set_token(&mut self, token: String) -> ApiResult<()> {
@@ -859,12 +1003,46 @@ impl HassRuntimeState {
     }
 
     pub fn parsed_url(&self) -> ApiResult<Url> {
-        if self.config.url.trim().is_empty() {
+        Self::parse_url(&self.config.url)
+    }
+
+    pub fn parse_url(raw: &str) -> ApiResult<Url> {
+        if raw.trim().is_empty() {
             return Err(ApiError::service_error(
                 "Home Assistant URL not set".to_string(),
             ));
         }
-        Ok(Url::parse(self.config.url.trim())?)
+
+        let url = Url::parse(raw.trim())?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ApiError::service_error(
+                "Home Assistant URL must use http or https".to_string(),
+            ));
+        }
+        if url.host_str().is_none() {
+            return Err(ApiError::service_error(
+                "Home Assistant URL must include a host".to_string(),
+            ));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ApiError::service_error(
+                "Home Assistant URL cannot contain credentials, query parameters, or fragments"
+                    .to_string(),
+            ));
+        }
+
+        Ok(url)
+    }
+
+    #[must_use]
+    pub fn same_origin(left: &Url, right: &Url) -> bool {
+        left.scheme() == right.scheme()
+            && left.host_str() == right.host_str()
+            && left.port_or_known_default() == right.port_or_known_default()
     }
 
     #[must_use]
@@ -874,6 +1052,63 @@ impl HassRuntimeState {
             .as_ref()
             .map(|x| x.trim().to_string())
             .filter(|x| !x.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    use super::{HassRuntimeConfig, HassRuntimeConfigUpdate, HassRuntimeState};
+    use camino::Utf8PathBuf;
+
+    fn state(url: &str) -> HassRuntimeState {
+        HassRuntimeState {
+            file: Utf8PathBuf::from("/dev/null"),
+            config: HassRuntimeConfig {
+                url: url.to_string(),
+                token: Some("secret".to_string()),
+                ..HassRuntimeConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_url_change_clears_token_only_for_a_new_origin() {
+        let mut same_origin = state("http://ha.local:8123");
+        same_origin
+            .set_config_update(HassRuntimeConfigUpdate {
+                enabled: true,
+                url: "http://ha.local:8123/".to_string(),
+                sync_mode: None,
+            })
+            .expect("same-origin URL should be accepted");
+        assert!(same_origin.config.token.is_some());
+
+        let mut new_origin = state("http://ha.local:8123");
+        new_origin
+            .set_config_update(HassRuntimeConfigUpdate {
+                enabled: true,
+                url: "https://other.local:8123".to_string(),
+                sync_mode: None,
+            })
+            .expect("new URL should be accepted");
+        assert!(new_origin.config.token.is_none());
+    }
+
+    #[test]
+    fn runtime_url_rejects_non_http_and_embedded_credentials() {
+        for url in ["file:///tmp/ha", "http://user:pass@ha.local:8123"] {
+            let mut state = state("http://ha.local:8123");
+            assert!(
+                state
+                    .set_config_update(HassRuntimeConfigUpdate {
+                        enabled: true,
+                        url: url.to_string(),
+                        sync_mode: None,
+                    })
+                    .is_err(),
+                "{url} should be rejected"
+            );
+        }
     }
 }
 
@@ -897,52 +1132,101 @@ struct HassUiStateFile {
     patina: HassPatinaState,
 }
 
+fn validate_yaml_config_mapping(mapping: &serde_yml::Mapping) -> ApiResult<()> {
+    let fields = mapping
+        .keys()
+        .map(|key| {
+            key.as_str().ok_or_else(|| {
+                ApiError::service_error("Bridge settings config keys must be strings")
+            })
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    validate_hass_ui_config_fields(fields)
+}
+
+fn parse_ui_state_file(raw: &str) -> ApiResult<(HassUiConfig, HassPatinaState)> {
+    let document = serde_yml::from_str::<serde_yml::Value>(raw)?;
+    let mapping = document
+        .as_mapping()
+        .ok_or_else(|| ApiError::service_error("Bridge settings file must be a YAML mapping"))?;
+
+    if mapping.contains_key(serde_yml::Value::from("config"))
+        || mapping.contains_key(serde_yml::Value::from("patina"))
+    {
+        let config = mapping
+            .get(serde_yml::Value::from("config"))
+            .and_then(serde_yml::Value::as_mapping)
+            .ok_or_else(|| {
+                ApiError::service_error("Bridge settings file must contain a mapping config field")
+            })?;
+        validate_yaml_config_mapping(config)?;
+        let state = serde_yml::from_str::<HassUiStateFile>(raw)?;
+        return Ok((state.config, state.patina));
+    }
+
+    validate_yaml_config_mapping(mapping)?;
+    let config = serde_yml::from_str::<HassUiConfig>(raw)?;
+    Ok((config, HassPatinaState::default()))
+}
+
 impl HassUiState {
     pub fn load(file: Utf8PathBuf) -> ApiResult<Self> {
-        let (mut config, patina) = if file.is_file() {
-            match fs::read_to_string(&file) {
-                Ok(raw) => {
-                    let has_v2_shape = serde_yml::from_str::<serde_yml::Value>(&raw)
-                        .ok()
-                        .and_then(|value| value.as_mapping().cloned())
-                        .is_some_and(|mapping| {
-                            mapping.contains_key(serde_yml::Value::from("config"))
-                                || mapping.contains_key(serde_yml::Value::from("patina"))
-                        });
-
-                    if has_v2_shape {
-                        match serde_yml::from_str::<HassUiStateFile>(&raw) {
-                            Ok(state) => (state.config, state.patina),
-                            Err(err) => {
-                                log::warn!(
-                                    "Failed to parse V2 UI state {}, using defaults: {}",
-                                    file,
-                                    err
-                                );
-                                (HassUiConfig::default(), HassPatinaState::default())
-                            }
-                        }
-                    } else {
-                        match serde_yml::from_str::<HassUiConfig>(&raw) {
-                            Ok(config) => (config, HassPatinaState::default()),
-                            Err(err) => {
-                                log::warn!(
-                                    "Failed to parse V1 UI state {}, using defaults: {}",
-                                    file,
-                                    err
-                                );
-                                (HassUiConfig::default(), HassPatinaState::default())
-                            }
-                        }
-                    }
+        let (mut config, patina, recovered_from_backup, migrated_from_legacy) = if file.is_file() {
+            let primary = match read_utf8_file(&file) {
+                Ok(raw) => parse_ui_state_file(&raw),
+                Err(error) if error.kind() == ErrorKind::InvalidData => {
+                    Err(ApiError::service_error(error.to_string()))
                 }
-                Err(err) => {
-                    log::warn!("Failed to read {}, using defaults: {}", file, err);
-                    (HassUiConfig::default(), HassPatinaState::default())
+                Err(error) => return Err(error.into()),
+            };
+            match primary {
+                Ok((config, patina)) => (config, patina, false, false),
+                Err(primary_err) => {
+                    let backup = backup_path(&file);
+                    if !backup.is_file() {
+                        return Err(ApiError::service_error(format!(
+                            "Failed to parse bridge settings {}: {primary_err}",
+                            file
+                        )));
+                    }
+
+                    let backup_raw = read_utf8_file(&backup).map_err(|backup_err| {
+                        ApiError::service_error(format!(
+                            "Failed to parse bridge settings {} ({primary_err}) and backup {} ({backup_err})",
+                            file, backup
+                        ))
+                    })?;
+                    let (config, patina) = parse_ui_state_file(&backup_raw).map_err(|backup_err| {
+                        ApiError::service_error(format!(
+                            "Failed to parse bridge settings {} ({primary_err}) and backup {} ({backup_err})",
+                            file, backup
+                        ))
+                    })?;
+                    log::warn!(
+                        "Recovered bridge settings from {} because {} could not be parsed: {}",
+                        backup,
+                        file,
+                        primary_err
+                    );
+                    (config, patina, true, false)
                 }
             }
+        } else if let Some(legacy) = legacy_data_file(&file).filter(|path| path.is_file()) {
+            let raw = read_utf8_file(&legacy)?;
+            let (config, patina) = parse_ui_state_file(&raw)?;
+            log::warn!(
+                "Migrating legacy bridge settings from {} to {}",
+                legacy,
+                file
+            );
+            (config, patina, false, true)
         } else {
-            (HassUiConfig::default(), HassPatinaState::default())
+            (
+                HassUiConfig::default(),
+                HassPatinaState::default(),
+                false,
+                false,
+            )
         };
         config.normalize();
 
@@ -955,7 +1239,7 @@ impl HassUiState {
             sync: HassSyncStatus::default(),
         };
 
-        if !state.file.is_file() {
+        if recovered_from_backup || migrated_from_legacy || !state.file.is_file() {
             state.save_config()?;
         }
 
@@ -972,13 +1256,23 @@ impl HassUiState {
         patina
             .interactions_by_key
             .retain(|k, _| !k.trim().is_empty());
-        let file = File::create(&self.file)?;
         let state = HassUiStateFile {
             config: cfg,
             patina,
         };
-        serde_yml::to_writer(file, &state)?;
-        Ok(())
+        let yaml = serde_yml::to_string(&state)?;
+
+        // Keep the last known-good settings beside the canonical file. The backup is written
+        // before the replacement, so a failed new write never destroys the previous snapshot.
+        if self.file.is_file() {
+            let previous = fs::read(&self.file)?;
+            if let Ok(previous) = String::from_utf8(previous) {
+                if parse_ui_state_file(&previous).is_ok() {
+                    atomic_write(&backup_path(&self.file), previous.as_bytes())?;
+                }
+            }
+        }
+        atomic_write(&self.file, yaml.as_bytes())
     }
 
     fn patina_days_since_install(&self) -> u64 {
@@ -1283,19 +1577,14 @@ pub struct HassSyncResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct HassApplyResponse {
-    pub applied: bool,
-    pub removed_devices: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HassResetBridgeResponse {
     pub reset: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HassConnectResponse {
-    pub connected: bool,
+    pub queued: bool,
+    pub enabled: bool,
     pub runtime: HassRuntimeConfigPublic,
 }
 
@@ -1322,5 +1611,395 @@ impl HassUiState {
         self.save_config()?;
         self.push_log(reason);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod atomic_save_tests {
+    use super::{
+        HassEntityPreference, HassFakeCloudMode, HassPatinaState, HassRuntimeConfig,
+        HassRuntimeState, HassSyncStatus, HassUiConfig, HassUiState, HassUiStateFile,
+        parse_ui_state_file,
+    };
+    use camino::Utf8PathBuf;
+    use std::collections::HashMap;
+    use std::fs;
+    use uuid::Uuid;
+
+    struct TestDir(Utf8PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("bifrost-hass-{}", Uuid::new_v4()));
+            fs::create_dir(&path).expect("test directory should be created");
+            Self(Utf8PathBuf::from_path_buf(path).expect("temporary path should be UTF-8"))
+        }
+
+        fn file(&self, name: &str) -> Utf8PathBuf {
+            self.0.join(name)
+        }
+
+        fn assert_no_temp_files(&self) {
+            let leftovers = fs::read_dir(&self.0)
+                .expect("test directory should be readable")
+                .map(|entry| {
+                    entry
+                        .expect("directory entry should be readable")
+                        .file_name()
+                })
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files remain: {leftovers:?}"
+            );
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_private(path: &Utf8PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(path)
+            .expect("saved file should exist")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "saved file must be private");
+    }
+
+    #[test]
+    fn runtime_save_writes_complete_yaml_and_reloads_all_fields() {
+        let dir = TestDir::new();
+        let file = dir.file("runtime.yaml");
+        let config = HassRuntimeConfig {
+            enabled: false,
+            url: "https://ha.local:8123".to_string(),
+            sync_mode: "websocket".to_string(),
+            token: Some("secret".to_string()),
+        };
+        let state = HassRuntimeState {
+            file: file.clone(),
+            config: config.clone(),
+        };
+
+        state.save().expect("runtime state should save");
+
+        let yaml = fs::read_to_string(&file).expect("saved runtime YAML should be readable");
+        let parsed: HassRuntimeConfig =
+            serde_yml::from_str(&yaml).expect("runtime YAML should be complete and parseable");
+        assert_eq!(parsed, config);
+        assert_eq!(HassRuntimeState::load(file, None).unwrap().config, config);
+        dir.assert_no_temp_files();
+        #[cfg(unix)]
+        assert_private(&state.file);
+    }
+
+    #[test]
+    fn atomic_save_keeps_existing_target_when_rename_fails() {
+        let dir = TestDir::new();
+        let file = dir.file("runtime.yaml");
+        fs::create_dir(&file).expect("target directory should be created");
+        fs::write(file.join("marker"), b"old target").expect("target marker should be written");
+        let state = HassRuntimeState {
+            file: file.clone(),
+            config: HassRuntimeConfig::default(),
+        };
+
+        assert!(
+            state.save().is_err(),
+            "renaming over a directory should fail"
+        );
+        assert_eq!(
+            fs::read(file.join("marker")).expect("old target should remain"),
+            b"old target"
+        );
+        dir.assert_no_temp_files();
+    }
+
+    #[test]
+    fn ui_save_writes_normalized_yaml_and_reloads_persistent_fields() {
+        let dir = TestDir::new();
+        let file = dir.file("hass-ui.yaml");
+        let mut config = HassUiConfig::default();
+        config.hidden_entity_ids = vec![" light.kitchen ".to_string()];
+        config.include_unavailable = false;
+        config.default_add_new_devices_to_hue = true;
+        config.sync_hass_areas_to_rooms = false;
+        config.fake_cloud_mode = HassFakeCloudMode::Connected;
+        config.hass_timezone = Some(" Europe/Amsterdam ".to_string());
+        config.entity_preferences.insert(
+            "light.kitchen".to_string(),
+            HassEntityPreference {
+                alias: Some("Kitchen".to_string()),
+                ..HassEntityPreference::default()
+            },
+        );
+        let patina = HassPatinaState {
+            install_date: "2026-08-14T10:00:00Z".to_string(),
+            interaction_count: 3,
+            interactions_by_key: HashMap::from([(String::from("boot"), 2)]),
+        };
+        let state = HassUiState {
+            file: file.clone(),
+            config,
+            patina: patina.clone(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+
+        state.save_config().expect("UI state should save");
+
+        let yaml = fs::read_to_string(&file).expect("saved UI YAML should be readable");
+        let stored: HassUiStateFile =
+            serde_yml::from_str(&yaml).expect("UI YAML should be complete and parseable");
+        assert_eq!(stored.patina, patina);
+        assert!(!stored.config.include_unavailable);
+        assert!(stored.config.default_add_new_devices_to_hue);
+        assert!(!stored.config.sync_hass_areas_to_rooms);
+        assert_eq!(stored.config.fake_cloud_mode, HassFakeCloudMode::Connected);
+        assert_eq!(
+            stored.config.hass_timezone.as_deref(),
+            Some("Europe/Amsterdam")
+        );
+        assert_eq!(stored.config.hidden_entity_ids, ["light.kitchen"]);
+        assert_eq!(
+            stored
+                .config
+                .entity_preferences
+                .get("light.kitchen")
+                .and_then(|pref| pref.alias.as_deref()),
+            Some("Kitchen")
+        );
+
+        let loaded = HassUiState::load(file).expect("UI state should reload");
+        assert_eq!(loaded.patina, patina);
+        assert_eq!(loaded.config.fake_cloud_mode, HassFakeCloudMode::Connected);
+        assert_eq!(
+            loaded.config.hass_timezone.as_deref(),
+            Some("Europe/Amsterdam")
+        );
+        dir.assert_no_temp_files();
+        #[cfg(unix)]
+        assert_private(&state.file);
+    }
+
+    #[test]
+    fn ui_save_keeps_previous_settings_in_a_private_backup() {
+        let dir = TestDir::new();
+        let file = dir.file("hass-ui.yaml");
+        let mut state = HassUiState {
+            file: file.clone(),
+            config: HassUiConfig::default(),
+            patina: HassPatinaState::default(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+        state.config.rooms.push(super::HassRoomConfig {
+            id: "first".to_string(),
+            name: "First".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        state.save_config().expect("first settings should save");
+
+        state.config.rooms.push(super::HassRoomConfig {
+            id: "second".to_string(),
+            name: "Second".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        state.save_config().expect("second settings should save");
+
+        let backup = dir.file("hass-ui.yaml.bak");
+        let stored: HassUiStateFile =
+            serde_yml::from_str(&fs::read_to_string(&backup).expect("backup should exist"))
+                .expect("backup should be valid YAML");
+        assert!(stored.config.rooms.iter().any(|room| room.id == "first"));
+        assert!(!stored.config.rooms.iter().any(|room| room.id == "second"));
+        #[cfg(unix)]
+        assert_private(&backup);
+    }
+
+    #[test]
+    fn ui_load_recovers_from_backup_but_fails_closed_without_one() {
+        let dir = TestDir::new();
+        let file = dir.file("hass-ui.yaml");
+        let state = HassUiState {
+            file: file.clone(),
+            config: HassUiConfig::default(),
+            patina: HassPatinaState::default(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+        state.save_config().expect("initial settings should save");
+        let mut changed = state.clone();
+        changed.config.rooms.push(super::HassRoomConfig {
+            id: "office".to_string(),
+            name: "Office".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        changed.save_config().expect("changed settings should save");
+
+        fs::write(&file, b"not: [valid").expect("canonical settings should be corruptible");
+        let recovered = HassUiState::load(file.clone()).expect("backup should recover settings");
+        assert_eq!(recovered.config.rooms, state.config.rooms);
+        assert!(
+            parse_ui_state_file(&fs::read_to_string(&file).expect("settings should be repaired"))
+                .is_ok()
+        );
+
+        fs::write(&file, [0xff]).expect("canonical settings should accept invalid UTF-8");
+        let recovered_utf8 =
+            HassUiState::load(file.clone()).expect("backup should recover invalid UTF-8");
+        assert_eq!(recovered_utf8.config.rooms, state.config.rooms);
+
+        fs::write(dir.file("hass-ui.yaml.bak"), b"also: [not valid")
+            .expect("backup should be corruptible");
+        fs::write(&file, b"still: [not valid").expect("canonical settings should be corruptible");
+        assert!(HassUiState::load(file).is_err());
+    }
+
+    #[test]
+    fn ui_parser_rejects_partial_or_unknown_config_shapes() {
+        for raw in [
+            "config: {}\n",
+            "config:\n  rooms: []\n",
+            "config:\n  unrelated: true\n",
+            "patina: {}\n",
+            "rooms: []\n",
+        ] {
+            assert!(parse_ui_state_file(raw).is_err(), "invalid settings: {raw}");
+        }
+
+        let raw = serde_yml::to_string(&HassUiConfig::default())
+            .expect("complete config should serialize");
+        assert!(parse_ui_state_file(&raw).is_ok());
+    }
+
+    #[test]
+    fn data_paths_migrate_legacy_settings_and_runtime_files() {
+        let dir = TestDir::new();
+        let legacy_ui = dir.file("hass-ui.yaml");
+        let mut ui = HassUiState {
+            file: legacy_ui.clone(),
+            config: HassUiConfig::default(),
+            patina: HassPatinaState::default(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+        ui.config.rooms.push(super::HassRoomConfig {
+            id: "legacy-room".to_string(),
+            name: "Legacy room".to_string(),
+            source_area: None,
+            auto_created: false,
+        });
+        ui.save_config().expect("legacy UI settings should save");
+
+        let legacy_runtime = dir.file("hass-runtime.yaml");
+        HassRuntimeState {
+            file: legacy_runtime.clone(),
+            config: HassRuntimeConfig {
+                enabled: true,
+                url: "http://ha.local:8123".to_string(),
+                sync_mode: "manual".to_string(),
+                token: Some("legacy-token".to_string()),
+            },
+        }
+        .save()
+        .expect("legacy runtime settings should save");
+
+        let migrated_ui = HassUiState::load(dir.file("data/hass-ui.yaml"))
+            .expect("legacy UI settings should migrate");
+        let migrated_runtime = HassRuntimeState::load(dir.file("data/hass-runtime.yaml"), None)
+            .expect("legacy runtime settings should migrate");
+        assert!(
+            migrated_ui
+                .config
+                .rooms
+                .iter()
+                .any(|room| room.id == "legacy-room")
+        );
+        assert_eq!(
+            migrated_runtime.config.token.as_deref(),
+            Some("legacy-token")
+        );
+        assert!(dir.file("data/hass-ui.yaml").is_file());
+        assert!(dir.file("data/hass-runtime.yaml").is_file());
+        assert!(legacy_ui.is_file());
+        assert!(legacy_runtime.is_file());
+    }
+}
+
+#[cfg(test)]
+mod response_serialization_tests {
+    use super::{HassConnectResponse, HassRuntimeConfigPublic, HassSyncResponse, HassSyncStatus};
+
+    #[test]
+    fn sync_and_apply_response_serializes_as_queued_sync_only() {
+        let response = HassSyncResponse {
+            queued: true,
+            sync: HassSyncStatus {
+                last_sync_at: Some("2026-08-14T12:00:00Z".to_string()),
+                last_sync_result: Some("ok".to_string()),
+                sync_in_progress: true,
+                last_sync_duration_ms: Some(42),
+            },
+        };
+
+        let value = serde_json::to_value(response).expect("sync response should serialize");
+
+        assert_eq!(value["queued"], true);
+        assert!(value.get("sync").is_some());
+        assert!(value.get("applied").is_none());
+        assert!(value.get("removed_devices").is_none());
+    }
+
+    #[test]
+    fn connect_and_disconnect_response_serializes_as_queued_enabled_runtime() {
+        for enabled in [true, false] {
+            let response = HassConnectResponse {
+                queued: true,
+                enabled,
+                runtime: HassRuntimeConfigPublic {
+                    enabled,
+                    url: "https://ha.local:8123".to_string(),
+                    sync_mode: "manual".to_string(),
+                    token_present: true,
+                },
+            };
+
+            let value = serde_json::to_value(response).expect("connect response should serialize");
+
+            assert_eq!(value["queued"], true);
+            assert_eq!(value["enabled"], enabled);
+            assert!(value.get("runtime").is_some());
+            assert!(value.get("connected").is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_public_response_contains_no_token() {
+        let response = HassRuntimeConfigPublic {
+            enabled: true,
+            url: "https://ha.local:8123".to_string(),
+            sync_mode: "manual".to_string(),
+            token_present: true,
+        };
+
+        let value = serde_json::to_value(response).expect("runtime response should serialize");
+
+        assert!(value.get("token").is_none());
+        assert!(value.get("token_present").is_some());
     }
 }

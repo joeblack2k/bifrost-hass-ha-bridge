@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod hass;
 pub mod service;
+pub mod settings;
 pub mod websocket;
 
 use std::error::Error;
@@ -55,6 +56,7 @@ pub fn router() -> Router<AppState> {
         .nest("/service", service::router())
         .nest("/backend", backend::router())
         .merge(hass::router())
+        .merge(settings::router())
         .route("/config", get(get_config))
         .route("/ws", any(websocket))
 }

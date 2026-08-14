@@ -7,6 +7,22 @@ fn power3_approx(input: f64, q: [f64; 4]) -> f64 {
         .mul_add(input, q[3])
 }
 
+/// Convert a Hue mirek value to Home Assistant's Kelvin representation.
+#[must_use]
+pub fn mirek_to_kelvin(mirek: u16) -> Option<u32> {
+    (mirek != 0).then(|| 1_000_000 / u32::from(mirek))
+}
+
+/// Convert Home Assistant's Kelvin representation to a Hue mirek value.
+#[must_use]
+pub fn kelvin_to_mirek(kelvin: u32) -> Option<u16> {
+    if kelvin == 0 {
+        return None;
+    }
+
+    Some((1_000_000 / kelvin).clamp(153, 500) as u16)
+}
+
 /// Convert an input CCT value (Corrected Color Temperature) to XY color coordinates
 ///
 /// Inspired by this implementation:
@@ -49,7 +65,7 @@ pub fn cct_to_xy(cct: f64) -> XY {
 
 #[cfg(test)]
 mod tests {
-    use crate::colortemp::cct_to_xy;
+    use crate::colortemp::{cct_to_xy, kelvin_to_mirek, mirek_to_kelvin};
     use crate::xy::XY;
     use crate::{compare, compare_float, compare_xy};
 
@@ -91,5 +107,14 @@ mod tests {
         let b = XY::new(0.3134, 0.3236);
 
         compare_xy!(a, b);
+    }
+
+    #[test]
+    fn test_mirek_kelvin_conversion() {
+        assert_eq!(mirek_to_kelvin(153), Some(6535));
+        assert_eq!(mirek_to_kelvin(500), Some(2000));
+        assert_eq!(mirek_to_kelvin(0), None);
+        assert_eq!(kelvin_to_mirek(2700), Some(370));
+        assert_eq!(kelvin_to_mirek(0), None);
     }
 }

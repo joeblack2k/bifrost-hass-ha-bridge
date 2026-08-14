@@ -75,6 +75,12 @@ export interface HassUiConfig {
   hass_long?: string | null
 }
 
+export interface BridgeSettingsExport {
+  kind: 'bifrost-bridge-settings'
+  schema_version: number
+  config: HassUiConfig
+}
+
 export interface HassEntitySummary {
   entity_id: string
   domain: 'light' | 'switch' | 'binary_sensor' | string

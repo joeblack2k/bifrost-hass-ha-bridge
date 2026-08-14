@@ -9,7 +9,6 @@ services:
       - /opt/config/secrets/bifrost-hass/bifrost-hass.env
     volumes:
       - ./config.yaml:/app/config.yaml:ro
-      - ./hass-ui.yaml:/app/hass-ui.yaml
       - ./data:/app/data
     networks:
       lan_macvlan:

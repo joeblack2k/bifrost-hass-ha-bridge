@@ -1,16 +1,18 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use maplit::btreeset;
 use serde_json::{Value, json};
 
 use hue::api::{
-    ColorTemperature, Device, DeviceArchetype, DeviceProductData, Dimming, DimmingUpdate,
-    GroupedLight, Light, LightColor, LightMetadata, Metadata, MirekSchema, Motion, On, RType,
-    Resource, ResourceLink, Room, RoomArchetype, RoomMetadata, ZigbeeConnectivity,
-    ZigbeeConnectivityStatus,
+    Button, ButtonData, ButtonMetadata, ButtonReport, ColorTemperature, Device, DeviceArchetype,
+    DeviceProductData, Dimming, DimmingUpdate, GroupedLight, Light, LightColor, LightDynamics,
+    LightDynamicsStatus, LightEffects, LightEffectsV2, LightGradient, LightLevel, LightMetadata,
+    Metadata, MirekSchema, Motion, On, RType, Resource, ResourceLink, Room, RoomArchetype,
+    RoomMetadata, Scene, Temperature, ZigbeeConnectivity, ZigbeeConnectivityStatus,
 };
+use hue::colortemp::kelvin_to_mirek;
 use hue::xy::XY;
 use uuid::Uuid;
 
@@ -23,6 +25,9 @@ use crate::model::hass::{
     HassEntitySummary, HassLightArchetype, HassSensorKind, HassSwitchMode, HassUiConfig,
 };
 use crate::resource::Resources;
+
+use super::projections;
+use super::{events, light_projection, scene_import};
 
 #[derive(Clone, Debug)]
 struct ImportedEntity {
@@ -42,6 +47,12 @@ struct ImportedEntity {
     sensor_enabled: bool,
     switch_mode: Option<HassSwitchMode>,
     light_archetype: Option<HassLightArchetype>,
+    sensor_value: Option<f64>,
+    gradient: Option<LightGradient>,
+    event_name: Option<String>,
+    event_values: Option<Value>,
+    event_time: Option<DateTime<Utc>>,
+    effect: Option<hue::api::LightEffect>,
 }
 
 impl ImportedEntity {
@@ -50,6 +61,8 @@ impl ImportedEntity {
             HassEntityKind::Light => "light",
             HassEntityKind::Switch => "switch",
             HassEntityKind::BinarySensor => "binary_sensor",
+            HassEntityKind::Sensor => "sensor",
+            HassEntityKind::Event => "event",
         }
     }
 
@@ -65,6 +78,9 @@ impl ImportedEntity {
             }
             HassServiceKind::Motion => "motion".to_string(),
             HassServiceKind::Contact => "contact".to_string(),
+            HassServiceKind::Temperature => "temperature".to_string(),
+            HassServiceKind::LightLevel => "light_level".to_string(),
+            HassServiceKind::Button => "button".to_string(),
         }
     }
 }
@@ -122,12 +138,19 @@ fn parse_light_capabilities(state: &HassState) -> HassLightCapabilities {
     let modes = parse_supported_color_modes(state);
     let has_brightness_attr = state.attributes.contains_key("brightness");
     let has_color_temp_attr = state.attributes.contains_key("color_temp");
+    let has_color_temp_kelvin_attr = state.attributes.contains_key("color_temp_kelvin");
     let has_xy_attr = state.attributes.contains_key("xy_color");
 
     let supports_color = modes
         .iter()
         .any(|m| matches!(m.as_str(), "xy" | "hs" | "rgb" | "rgbw" | "rgbww"));
-    let supports_color_temp = modes.contains("color_temp") || has_color_temp_attr;
+    let supports_color_temp =
+        modes.contains("color_temp") || has_color_temp_attr || has_color_temp_kelvin_attr;
+    let effect_names = light_projection::supported_effect_names(&state.attributes);
+    let effect_values = effect_names
+        .iter()
+        .map(|(effect, _)| *effect)
+        .collect::<Vec<_>>();
     let supports_brightness = has_brightness_attr
         || modes.iter().any(|m| {
             matches!(
@@ -140,6 +163,10 @@ fn parse_light_capabilities(state: &HassState) -> HassLightCapabilities {
         supports_brightness,
         supports_color: supports_color || has_xy_attr,
         supports_color_temp,
+        supports_effects: !effect_values.is_empty(),
+        supports_gradient: light_projection::supports_gradient(&state.attributes),
+        effect_values,
+        effect_names,
     }
 }
 
@@ -187,6 +214,21 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
                 Some(detected),
             )
         }
+        "sensor" => {
+            let service_kind = projections::classify_sensor(state)?;
+            (
+                HassEntityKind::Sensor,
+                service_kind,
+                HassLightCapabilities::default(),
+                None,
+            )
+        }
+        "event" => (
+            HassEntityKind::Event,
+            HassServiceKind::Button,
+            HassLightCapabilities::default(),
+            None,
+        ),
         _ => return None,
     };
 
@@ -217,12 +259,53 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
     let color_temp = if matches!(kind, HassEntityKind::Light) && capabilities.supports_color_temp {
         state
             .attributes
-            .get("color_temp")
+            .get("color_temp_kelvin")
             .and_then(value_to_u16)
-            .map(|x| x.clamp(153, 500))
+            .and_then(|x| kelvin_to_mirek(u32::from(x)))
+            .or_else(|| {
+                state
+                    .attributes
+                    .get("color_temp")
+                    .and_then(value_to_u16)
+                    .map(|x| x.clamp(153, 500))
+            })
     } else {
         None
     };
+
+    let event_name = matches!(kind, HassEntityKind::Event)
+        .then(|| {
+            state
+                .attributes
+                .get("event_type")
+                .and_then(Value::as_str)
+                .and_then(events::normalize_event_value)
+                .or_else(|| {
+                    let state_value = state.state.trim();
+                    if state_value.is_empty()
+                        || matches!(state_value, "unknown" | "unavailable")
+                        || DateTime::parse_from_rfc3339(state_value).is_ok()
+                    {
+                        None
+                    } else {
+                        events::normalize_event_value(state_value)
+                    }
+                })
+        })
+        .flatten();
+    let event_values = matches!(kind, HassEntityKind::Event)
+        .then(|| {
+            state
+                .attributes
+                .get("event_types")
+                .or_else(|| state.attributes.get("event_values"))
+                .and_then(events::normalize_event_values)
+        })
+        .flatten();
+
+    if matches!(kind, HassEntityKind::Event) && event_values.is_none() {
+        return None;
+    }
 
     Some(ImportedEntity {
         entity_id: state.entity_id.clone(),
@@ -245,6 +328,27 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
             None
         },
         light_archetype: None,
+        sensor_value: matches!(kind, HassEntityKind::Sensor)
+            .then(|| projections::numeric_value(state))
+            .flatten(),
+        gradient: matches!(kind, HassEntityKind::Light)
+            .then(|| light_projection::gradient_from_attributes(&state.attributes))
+            .flatten(),
+        event_name,
+        event_values,
+        event_time: matches!(kind, HassEntityKind::Event)
+            .then(|| DateTime::parse_from_rfc3339(state.state.trim()).ok())
+            .flatten()
+            .map(|value| value.with_timezone(&Utc)),
+        effect: matches!(kind, HassEntityKind::Light)
+            .then(|| {
+                state
+                    .attributes
+                    .get("effect")
+                    .and_then(Value::as_str)
+                    .and_then(light_projection::parse_effect)
+            })
+            .flatten(),
     })
 }
 
@@ -294,7 +398,9 @@ fn light_archetype(imported: &ImportedEntity) -> DeviceArchetype {
                 DeviceArchetype::Plug
             }
         }
-        HassEntityKind::BinarySensor => DeviceArchetype::UnknownArchetype,
+        HassEntityKind::BinarySensor | HassEntityKind::Sensor | HassEntityKind::Event => {
+            DeviceArchetype::UnknownArchetype
+        }
     }
 }
 
@@ -389,13 +495,71 @@ fn apply_light_state(light: &mut Light, imported: &ImportedEntity) {
                 light.color_temperature_delta = None;
             }
         }
-        HassEntityKind::Switch | HassEntityKind::BinarySensor => {
+        HassEntityKind::Switch
+        | HassEntityKind::BinarySensor
+        | HassEntityKind::Sensor
+        | HassEntityKind::Event => {
             light.dimming = None;
             light.color = None;
             light.color_temperature = None;
             light.color_temperature_delta = None;
         }
     }
+
+    // Light::new contains the complete Hue capability set. HA-backed resources must only expose
+    // controls handled by backend_light_update; this is deliberately scoped to this importer so
+    // real Zigbee/Z2M lights keep their native capabilities.
+    light.alert = None;
+    light.color_temperature_delta = None;
+    light.dimming_delta = None;
+    let effect_values = imported.capabilities.effect_values.clone();
+    let mut status_values = vec![hue::api::LightEffect::NoEffect];
+    let additional_status_values = effect_values
+        .iter()
+        .copied()
+        .filter(|effect| !status_values.contains(effect))
+        .collect::<Vec<_>>();
+    status_values.extend(additional_status_values);
+    let current_effect = imported.effect.unwrap_or(hue::api::LightEffect::NoEffect);
+    light.effects =
+        (imported.kind == HassEntityKind::Light && !effect_values.is_empty()).then(|| {
+            LightEffects {
+                status_values: status_values.clone(),
+                status: current_effect,
+                effect_values: effect_values.clone(),
+            }
+        });
+    light.effects_v2 =
+        (imported.kind == HassEntityKind::Light && !effect_values.is_empty()).then(|| {
+            LightEffectsV2 {
+                action: hue::api::LightEffectValues {
+                    effect_values: effect_values.clone(),
+                },
+                status: hue::api::LightEffectStatus {
+                    effect: current_effect,
+                    effect_values: status_values,
+                    parameters: None,
+                },
+            }
+        });
+    light.gradient = (imported.kind == HassEntityKind::Light)
+        .then(|| imported.gradient.clone())
+        .flatten();
+    light.service_id = None;
+    light.timed_effects = None;
+    light.signaling = None;
+    light.dynamics = match imported.kind {
+        HassEntityKind::Light => Some(LightDynamics {
+            status: LightDynamicsStatus::None,
+            status_values: vec![LightDynamicsStatus::None],
+            speed: 0.0,
+            speed_valid: false,
+        }),
+        HassEntityKind::Switch
+        | HassEntityKind::BinarySensor
+        | HassEntityKind::Sensor
+        | HassEntityKind::Event => None,
+    };
 }
 
 fn make_contact_resource(imported: &ImportedEntity, device_link: ResourceLink) -> Value {
@@ -408,6 +572,36 @@ fn make_contact_resource(imported: &ImportedEntity, device_link: ResourceLink) -
             "last_updated": Utc::now().to_rfc3339(),
         }
     })
+}
+
+fn make_button_resource(imported: &ImportedEntity, device_link: ResourceLink) -> Button {
+    let event = imported.event_name.clone();
+    Button {
+        owner: device_link,
+        metadata: ButtonMetadata { control_id: 0 },
+        button: ButtonData {
+            button_report: imported
+                .event_time
+                .zip(event.clone())
+                .map(|(updated, event)| ButtonReport { updated, event }),
+            last_event: imported
+                .event_time
+                .is_some()
+                .then(|| event.map(Value::String))
+                .flatten(),
+            repeat_interval: Some(100),
+            event_values: imported.event_values.clone().or_else(|| {
+                Some(json!([
+                    "initial_press",
+                    "short_release",
+                    "long_press",
+                    "long_release",
+                    "double_short_release",
+                    "repeat"
+                ]))
+            }),
+        },
+    }
 }
 
 impl HassBackend {
@@ -423,6 +617,13 @@ impl HassBackend {
             }
             HassServiceKind::Motion => RType::Motion.deterministic(format!("{key}:motion")),
             HassServiceKind::Contact => RType::Contact.deterministic(format!("{key}:contact")),
+            HassServiceKind::Temperature => {
+                RType::Temperature.deterministic(format!("{key}:temperature"))
+            }
+            HassServiceKind::LightLevel => {
+                RType::LightLevel.deterministic(format!("{key}:light_level"))
+            }
+            HassServiceKind::Button => RType::Button.deterministic(format!("{key}:button")),
         };
         (
             RType::Device.deterministic(format!("{key}:device")),
@@ -585,7 +786,7 @@ impl HassBackend {
                 service_kind: imported.service_kind,
                 service_link,
                 device_link,
-                capabilities: imported.capabilities,
+                capabilities: imported.capabilities.clone(),
                 switch_mode: imported.switch_mode,
             });
 
@@ -595,12 +796,13 @@ impl HassBackend {
         binding.service_kind = imported.service_kind;
         binding.service_link = service_link;
         binding.device_link = device_link;
-        binding.capabilities = imported.capabilities;
+        binding.capabilities = imported.capabilities.clone();
         binding.switch_mode = imported.switch_mode;
 
         if previous_service_link != binding.service_link {
             self.light_map.remove(&previous_service_link.rid);
             self.sensor_map.remove(&previous_service_link.rid);
+            self.button_map.remove(&previous_service_link.rid);
             if res.get_resource(&previous_service_link).is_ok() {
                 let _ = res.delete(&previous_service_link);
             }
@@ -614,10 +816,19 @@ impl HassBackend {
                     .insert(binding.service_link.rid, imported.entity_id.clone());
                 self.sensor_map.remove(&binding.service_link.rid);
             }
-            HassServiceKind::Motion | HassServiceKind::Contact => {
+            HassServiceKind::Motion
+            | HassServiceKind::Contact
+            | HassServiceKind::Temperature
+            | HassServiceKind::LightLevel => {
                 self.sensor_map
                     .insert(binding.service_link.rid, imported.entity_id.clone());
                 self.light_map.remove(&binding.service_link.rid);
+            }
+            HassServiceKind::Button => {
+                self.button_map
+                    .insert(binding.service_link.rid, imported.entity_id.clone());
+                self.light_map.remove(&binding.service_link.rid);
+                self.sensor_map.remove(&binding.service_link.rid);
             }
         }
 
@@ -657,6 +868,9 @@ impl HassBackend {
                         binding.device_link,
                         LightMetadata::new(light_archetype(imported), &imported.name),
                     );
+                    // HA has no portable startup hook; expose no default power-up, while
+                    // apply_light_state deliberately preserves a user-configured one.
+                    light.powerup = None;
                     apply_light_state(&mut light, imported);
                     res.add(&binding.service_link, Resource::Light(light))?;
                 } else {
@@ -698,6 +912,60 @@ impl HassBackend {
                 }
                 res.add(&binding.service_link, Resource::Contact(value))?;
             }
+            HassServiceKind::Temperature => {
+                let value = projections::resource_payload(
+                    imported.service_kind,
+                    imported.sensor_value,
+                    imported.available,
+                );
+                if res.get::<Temperature>(&binding.service_link).is_err() {
+                    res.add(
+                        &binding.service_link,
+                        Resource::Temperature(Temperature {
+                            enabled: imported.sensor_enabled,
+                            owner: binding.device_link,
+                            temperature: value,
+                        }),
+                    )?;
+                } else {
+                    res.update::<Temperature>(&binding.service_link.rid, |temperature| {
+                        temperature.enabled = imported.sensor_enabled;
+                        temperature.temperature = value.clone();
+                    })?;
+                }
+            }
+            HassServiceKind::LightLevel => {
+                let value = projections::resource_payload(
+                    imported.service_kind,
+                    imported.sensor_value,
+                    imported.available,
+                );
+                if res.get::<LightLevel>(&binding.service_link).is_err() {
+                    res.add(
+                        &binding.service_link,
+                        Resource::LightLevel(LightLevel {
+                            enabled: imported.sensor_enabled,
+                            owner: binding.device_link,
+                            light: value,
+                        }),
+                    )?;
+                } else {
+                    res.update::<LightLevel>(&binding.service_link.rid, |light_level| {
+                        light_level.enabled = imported.sensor_enabled;
+                        light_level.light = value.clone();
+                    })?;
+                }
+            }
+            HassServiceKind::Button => {
+                let button = make_button_resource(imported, binding.device_link);
+                if res.get::<Button>(&binding.service_link).is_err() {
+                    res.add(&binding.service_link, Resource::Button(button))?;
+                } else {
+                    res.update::<Button>(&binding.service_link.rid, |current| {
+                        *current = button.clone();
+                    })?;
+                }
+            }
         }
 
         Ok(())
@@ -736,6 +1004,7 @@ impl HassBackend {
                     if let Some(binding) = self.entity_map.remove(&entity_id) {
                         self.light_map.remove(&binding.service_link.rid);
                         self.sensor_map.remove(&binding.service_link.rid);
+                        self.button_map.remove(&binding.service_link.rid);
                     }
                 }
             }
@@ -763,7 +1032,9 @@ impl HassBackend {
                     HassEntityKind::Switch => {
                         binding.switch_mode.unwrap_or(HassSwitchMode::Plug) == HassSwitchMode::Light
                     }
-                    HassEntityKind::BinarySensor => false,
+                    HassEntityKind::BinarySensor
+                    | HassEntityKind::Sensor
+                    | HassEntityKind::Event => false,
                 };
                 if !grouped_as_light {
                     continue;
@@ -814,6 +1085,108 @@ impl HassBackend {
         HassUiConfig::DEFAULT_ROOM_ID.to_string()
     }
 
+    fn assigned_scene_room_id(
+        config: &HassUiConfig,
+        imported: &scene_import::ImportedScene,
+        area_map: &HashMap<String, String>,
+    ) -> String {
+        if let Some(room_id) = config
+            .entity_preferences
+            .get(&imported.entity_id)
+            .and_then(|preference| preference.room_id.as_ref())
+            .filter(|room_id| config.rooms.iter().any(|room| &room.id == *room_id))
+        {
+            return room_id.clone();
+        }
+
+        if config.sync_hass_areas_to_rooms {
+            if let Some(area_name) = imported.area_name.as_deref() {
+                if let Some(room_id) = config.room_for_area(area_name) {
+                    return room_id;
+                }
+            }
+            for target in &imported.targets {
+                if let Some(area_name) = area_map.get(target) {
+                    if let Some(room_id) = config.room_for_area(area_name) {
+                        return room_id;
+                    }
+                }
+            }
+        }
+
+        HassUiConfig::DEFAULT_ROOM_ID.to_string()
+    }
+
+    fn sync_imported_scene(
+        &mut self,
+        imported: &scene_import::ImportedScene,
+        states: &HashMap<String, HassState>,
+        config: &HassUiConfig,
+        area_map: &HashMap<String, String>,
+        res: &mut Resources,
+    ) -> ApiResult<Option<ResourceLink>> {
+        if !config.should_include(&imported.entity_id, &imported.name, imported.available) {
+            return Ok(None);
+        }
+
+        let room_id = Self::assigned_scene_room_id(config, imported, area_map);
+        let Some(room) = self.room_map.get(&room_id) else {
+            return Ok(None);
+        };
+        let actions = imported
+            .targets
+            .iter()
+            .filter_map(|target| {
+                let binding = self.entity_map.get(target)?;
+                let include = match binding.kind {
+                    HassEntityKind::Light => true,
+                    HassEntityKind::Switch => {
+                        binding.switch_mode.unwrap_or(HassSwitchMode::Plug) == HassSwitchMode::Light
+                    }
+                    HassEntityKind::BinarySensor
+                    | HassEntityKind::Sensor
+                    | HassEntityKind::Event => false,
+                };
+                include
+                    .then(|| scene_import::scene_action(binding.service_link, states.get(target)))
+            })
+            .collect::<Vec<_>>();
+
+        let link = scene_import::link(&self.name, &imported.entity_id);
+        let scene = scene_import::build(imported, room.room_link, actions);
+        if res.get::<Scene>(&link).is_err() {
+            res.add(&link, Resource::Scene(scene))?;
+        } else {
+            res.update::<Scene>(&link.rid, |current| *current = scene.clone())?;
+        }
+        self.scene_map.insert(link.rid, imported.entity_id.clone());
+        Ok(Some(link))
+    }
+
+    fn prune_persisted_imported_scenes(
+        &mut self,
+        res: &mut Resources,
+        keep_scene_rids: &HashSet<Uuid>,
+    ) -> usize {
+        let mut removed = 0;
+        for rid in res.get_resource_ids_by_type(RType::Scene) {
+            let imported = res
+                .get_id::<Scene>(rid)
+                .ok()
+                .is_some_and(scene_import::is_imported);
+            if !imported || keep_scene_rids.contains(&rid) {
+                continue;
+            }
+
+            if res.delete(&RType::Scene.link_to(rid)).is_ok() {
+                self.scene_map.remove(&rid);
+                self.imported_scene_map.remove(&rid);
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     pub(super) async fn sync_entities(&mut self) -> ApiResult<()> {
         self.apply_runtime_connection().await?;
 
@@ -840,6 +1213,10 @@ impl HassBackend {
             })
             .collect::<Vec<_>>();
         parsed.sort_by(|a, b| a.entity_id.cmp(&b.entity_id));
+        let parsed_scenes = states
+            .iter()
+            .filter_map(|state| scene_import::parse(state, area_map.get(&state.entity_id).cloned()))
+            .collect::<Vec<_>>();
 
         let mut ui_state = self.ui_state.lock().await;
         let mut ui_config = ui_state.config_normalized();
@@ -906,6 +1283,11 @@ impl HassBackend {
                         HassSensorKind::Contact => HassServiceKind::Contact,
                         HassSensorKind::Ignore => imported.service_kind,
                     };
+            }
+            if matches!(
+                imported.kind,
+                HassEntityKind::BinarySensor | HassEntityKind::Sensor
+            ) {
                 imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
             }
 
@@ -915,7 +1297,11 @@ impl HassBackend {
             let selected_sensor_kind = match imported.service_kind {
                 HassServiceKind::Motion => Some(HassSensorKind::Motion),
                 HassServiceKind::Contact => Some(HassSensorKind::Contact),
-                HassServiceKind::Light | HassServiceKind::Switch => None,
+                HassServiceKind::Light
+                | HassServiceKind::Switch
+                | HassServiceKind::Temperature
+                | HassServiceKind::LightLevel
+                | HassServiceKind::Button => None,
             };
 
             let mut included =
@@ -956,6 +1342,34 @@ impl HassBackend {
             });
         }
 
+        for imported in &parsed_scenes {
+            let hidden = ui_config.is_manually_hidden(&imported.entity_id);
+            let included =
+                ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
+            let room_id = Self::assigned_scene_room_id(&ui_config, imported, &area_map);
+            summaries.push(HassEntitySummary {
+                entity_id: imported.entity_id.clone(),
+                domain: "scene".to_string(),
+                name: imported.name.clone(),
+                state: imported.state.clone(),
+                available: imported.available,
+                included,
+                hidden,
+                area_name: imported.area_name.clone(),
+                room_id: room_id.clone(),
+                room_name: ui_config.room_name(&room_id),
+                mapped_type: "scene".to_string(),
+                supports_brightness: false,
+                supports_color: false,
+                supports_color_temp: false,
+                switch_mode: None,
+                sensor_kind: None,
+                light_archetype: None,
+                enabled: true,
+            });
+        }
+        summaries.sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
+
         {
             let mut ui_state = self.ui_state.lock().await;
             ui_state.entities = summaries;
@@ -971,8 +1385,24 @@ impl HassBackend {
 
         // If the user previously exposed many entities, they may still exist in the persisted
         // Hue resource DB after a restart (since `entity_map` is in-memory only). Always prune
-        // any Home Assistant-generated devices that are no longer included.
-        let keep_device_rids = imported_included
+        // any Home Assistant-generated devices that are no longer included. Keep only unavailable
+        // lights that carry bridge-local power-up state; ordinary unavailable resources retain the
+        // existing include_unavailable behavior.
+        let unavailable_powerup_lights = parsed
+            .iter()
+            .filter_map(|imported| {
+                if imported.kind != HassEntityKind::Light || imported.available {
+                    return None;
+                }
+                let (device_link, service_link) =
+                    self.links_for_entity(&imported.entity_id, imported.service_kind);
+                res.get::<Light>(&service_link)
+                    .ok()
+                    .filter(|light| light.powerup.is_some())
+                    .map(|_| (imported.entity_id.clone(), device_link.rid))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut keep_device_rids = imported_included
             .values()
             .map(|imported| {
                 let (device_link, _service_link) =
@@ -980,6 +1410,7 @@ impl HassBackend {
                 device_link.rid
             })
             .collect::<HashSet<_>>();
+        keep_device_rids.extend(unavailable_powerup_lights.values().copied());
         let pruned = self.prune_homeassistant_devices(&mut res, &keep_device_rids)?;
         if pruned > 0 {
             self.ui_log(format!(
@@ -998,14 +1429,17 @@ impl HassBackend {
             if let Some(binding) = self.entity_map.remove(&entity_id) {
                 self.light_map.remove(&binding.service_link.rid);
                 self.sensor_map.remove(&binding.service_link.rid);
+                self.button_map.remove(&binding.service_link.rid);
                 self.device_map.remove(&binding.device_link.rid);
-                if let Err(err) = res.delete(&binding.device_link) {
-                    log::warn!(
-                        "[{}] Failed to delete stale entity {}: {}",
-                        self.name,
-                        entity_id,
-                        err
-                    );
+                if !unavailable_powerup_lights.contains_key(&entity_id) {
+                    if let Err(err) = res.delete(&binding.device_link) {
+                        log::warn!(
+                            "[{}] Failed to delete stale entity {}: {}",
+                            self.name,
+                            entity_id,
+                            err
+                        );
+                    }
                 }
             }
         }
@@ -1039,6 +1473,28 @@ impl HassBackend {
 
         self.sync_grouped_light_states(&imported_included, &entity_room, &mut res)?;
 
+        let scene_states = states
+            .iter()
+            .map(|state| (state.entity_id.clone(), state.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut imported_scenes = HashMap::new();
+        for imported in &parsed_scenes {
+            if let Some(link) =
+                self.sync_imported_scene(imported, &scene_states, &ui_config, &area_map, &mut res)?
+            {
+                imported_scenes.insert(link.rid, imported.entity_id.clone());
+            }
+        }
+        let kept_scene_rids = imported_scenes.keys().copied().collect::<HashSet<_>>();
+        let pruned_scenes = self.prune_persisted_imported_scenes(&mut res, &kept_scene_rids);
+        if pruned_scenes > 0 {
+            self.ui_log(format!(
+                "Pruned {pruned_scenes} stale Home Assistant scenes from Hue bridge"
+            ))
+            .await;
+        }
+        self.imported_scene_map = imported_scenes;
+
         self.ui_log(format!(
             "Synced {} entities ({} exposed, {} hidden) across {} rooms",
             parsed.len(),
@@ -1056,6 +1512,12 @@ impl HassBackend {
 
         let state = self.client.get_state(entity_id).await?;
         let area_name = self.client.get_entity_area(entity_id).await.ok().flatten();
+        if scene_import::parse(&state, area_name.clone()).is_some() {
+            // Scene attributes contain the complete target list only on a full state read. A
+            // single-scene update therefore reuses the normal full-sync path instead of creating
+            // a partial resource that could silently lose targets.
+            return self.sync_entities().await;
+        }
         let Some(mut imported) = parse_imported_entity(&state, area_name) else {
             return Err(crate::error::ApiError::service_error(format!(
                 "[{}] Unsupported Home Assistant entity {}",
@@ -1112,6 +1574,11 @@ impl HassBackend {
                 HassSensorKind::Contact => HassServiceKind::Contact,
                 HassSensorKind::Ignore => imported.service_kind,
             };
+        }
+        if matches!(
+            imported.kind,
+            HassEntityKind::BinarySensor | HassEntityKind::Sensor
+        ) {
             imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
         }
 
@@ -1145,6 +1612,10 @@ impl HassBackend {
 
     pub(super) async fn handle_state_update(&mut self, state: HassState) -> ApiResult<()> {
         // Realtime HA -> Hue sync: update only included entities without polling.
+        if scene_import::parse(&state, None).is_some() {
+            return self.sync_entities().await;
+        }
+
         let ui_state = self.ui_state.lock().await;
         let ui_config = ui_state.config_normalized();
         drop(ui_state);
@@ -1159,7 +1630,7 @@ impl HassBackend {
             && imported.capabilities == HassLightCapabilities::default()
         {
             if let Some(existing) = self.entity_map.get(&imported.entity_id) {
-                imported.capabilities = existing.capabilities;
+                imported.capabilities = existing.capabilities.clone();
             }
         }
 
@@ -1202,6 +1673,11 @@ impl HassBackend {
                 HassSensorKind::Contact => HassServiceKind::Contact,
                 HassSensorKind::Ignore => imported.service_kind,
             };
+        }
+        if matches!(
+            imported.kind,
+            HassEntityKind::BinarySensor | HassEntityKind::Sensor
+        ) {
             imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
         }
 
@@ -1225,11 +1701,238 @@ impl HassBackend {
         if let Some(binding) = self.entity_map.remove(entity_id) {
             self.light_map.remove(&binding.service_link.rid);
             self.sensor_map.remove(&binding.service_link.rid);
+            self.button_map.remove(&binding.service_link.rid);
             self.device_map.remove(&binding.device_link.rid);
+        }
+
+        if entity_id.starts_with("scene.") {
+            let link = scene_import::link(&self.name, entity_id);
+            let mut res = self.state.lock().await;
+            let _ = res.delete(&link);
+            self.imported_scene_map.remove(&link.rid);
+            self.scene_map.remove(&link.rid);
         }
 
         self.ui_log(format!("Removed {} from Hue bridge", entity_id))
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_light_state, parse_imported_entity};
+    use crate::backend::hass::client::HassState;
+    use crate::backend::hass::{HassEntityKind, HassServiceKind};
+    use hue::api::{DeviceArchetype, Light, LightMetadata, RType};
+    use serde_json::json;
+
+    fn light_state(attributes: serde_json::Map<String, serde_json::Value>) -> HassState {
+        HassState {
+            entity_id: "light.test".to_string(),
+            state: "on".to_string(),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn imports_modern_kelvin_color_temperature() {
+        let attributes = json!({
+            "friendly_name": "Test light",
+            "supported_color_modes": ["color_temp"],
+            "color_temp_kelvin": 2700
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        assert!(imported.capabilities.supports_color_temp);
+        assert_eq!(imported.color_temp, Some(370));
+    }
+
+    #[test]
+    fn keeps_legacy_mirek_color_temperature_as_fallback() {
+        let attributes = json!({
+            "friendly_name": "Test light",
+            "supported_color_modes": ["color_temp"],
+            "color_temp": 400
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        assert_eq!(imported.color_temp, Some(400));
+    }
+
+    #[test]
+    fn imports_supported_numeric_sensor_without_turning_it_into_a_light() {
+        let state = HassState {
+            entity_id: "sensor.room_temperature".to_string(),
+            state: "21.5".to_string(),
+            attributes: json!({
+                "friendly_name": "Room temperature",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C"
+            })
+            .as_object()
+            .cloned()
+            .expect("object attributes"),
+        };
+
+        let imported = parse_imported_entity(&state, None).expect("numeric sensor");
+        assert_eq!(imported.kind, HassEntityKind::Sensor);
+        assert_eq!(imported.service_kind, HassServiceKind::Temperature);
+        assert_eq!(imported.mapped_type(), "temperature");
+        assert_eq!(imported.sensor_value, Some(21.5));
+    }
+
+    #[test]
+    fn imports_event_entity_as_normalized_button_taxonomy() {
+        let state = HassState {
+            entity_id: "event.dimmer_button".to_string(),
+            state: "2026-08-14T18:45:26.156+00:00".to_string(),
+            attributes: json!({
+                "friendly_name": "Dimmer button",
+                "event_type": "short_release",
+                "event_types": ["initial_press", "repeat", "short_release", "long_press", "long_release"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object attributes"),
+        };
+
+        let imported = parse_imported_entity(&state, None).expect("event entity");
+
+        assert_eq!(imported.kind, HassEntityKind::Event);
+        assert_eq!(imported.event_name.as_deref(), Some("short_release"));
+        assert_eq!(
+            imported.event_values,
+            Some(json!([
+                "initial_press",
+                "repeat",
+                "short_release",
+                "long_press",
+                "long_release"
+            ]))
+        );
+        assert!(imported.event_time.is_some());
+    }
+
+    #[test]
+    fn ignores_non_accessory_event_entities_and_unstamped_reports() {
+        let unsupported = HassState {
+            entity_id: "event.system_backup".to_string(),
+            state: "unknown".to_string(),
+            attributes: json!({
+                "friendly_name": "Backup",
+                "event_types": ["completed", "failed"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        };
+        assert!(parse_imported_entity(&unsupported, None).is_none());
+
+        let unstamped = HassState {
+            entity_id: "event.dimmer_button".to_string(),
+            state: "unknown".to_string(),
+            attributes: json!({
+                "friendly_name": "Dimmer button",
+                "event_type": "short_release",
+                "event_types": ["short_release"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        };
+        let imported = parse_imported_entity(&unstamped, None).expect("event entity");
+        assert!(imported.event_time.is_none());
+    }
+
+    #[test]
+    fn ha_lights_do_not_advertise_unhandled_hue_controls() {
+        let attributes = json!({
+            "friendly_name": "On off light",
+            "supported_color_modes": ["onoff"]
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        let mut light = Light::new(
+            RType::Device.deterministic("test-device"),
+            LightMetadata::new(DeviceArchetype::ClassicBulb, "On off light"),
+        );
+        light.powerup = None;
+
+        apply_light_state(&mut light, &imported);
+
+        assert!(light.alert.is_none());
+        assert!(light.dimming.is_none());
+        assert!(light.color.is_none());
+        assert!(light.color_temperature.is_none());
+        assert!(light.color_temperature_delta.is_none());
+        assert!(light.dimming_delta.is_none());
+        assert!(light.effects.is_none());
+        assert!(light.effects_v2.is_none());
+        assert!(light.gradient.is_none());
+        assert!(light.powerup.is_none());
+        assert!(light.signaling.is_none());
+        assert!(light.timed_effects.is_none());
+        assert!(light.service_id.is_none());
+        assert_eq!(
+            light
+                .dynamics
+                .expect("transitions are the only dynamics capability")
+                .status_values,
+            vec![hue::api::LightDynamicsStatus::None]
+        );
+    }
+
+    #[test]
+    fn preserves_local_powerup_during_home_assistant_state_sync() {
+        let attributes = json!({
+            "friendly_name": "On off light",
+            "supported_color_modes": ["onoff"]
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        let mut light = Light::new(
+            RType::Device.deterministic("test-device"),
+            LightMetadata::new(DeviceArchetype::ClassicBulb, "On off light"),
+        );
+
+        apply_light_state(&mut light, &imported);
+
+        assert!(light.powerup.is_some());
+    }
+
+    #[test]
+    fn preserves_local_powerup_when_home_assistant_light_is_unavailable() {
+        let state = HassState {
+            entity_id: "light.test".to_string(),
+            state: "unavailable".to_string(),
+            attributes: json!({
+                "friendly_name": "Test light",
+                "supported_color_modes": ["onoff"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object attributes"),
+        };
+        let imported = parse_imported_entity(&state, None).expect("light");
+        let mut light = Light::new(
+            RType::Device.deterministic("test-device"),
+            LightMetadata::new(DeviceArchetype::ClassicBulb, "Test light"),
+        );
+
+        apply_light_state(&mut light, &imported);
+
+        assert!(!imported.available);
+        assert!(light.powerup.is_some());
     }
 }

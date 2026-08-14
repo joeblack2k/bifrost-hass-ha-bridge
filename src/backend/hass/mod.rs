@@ -1,6 +1,10 @@
 mod backend_event;
 mod client;
+mod events;
 mod import;
+mod light_projection;
+mod projections;
+mod scene_import;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -17,7 +21,7 @@ use uuid::Uuid;
 
 use bifrost_api::backend::BackendRequest;
 use bifrost_api::config::HassServer;
-use hue::api::{RType, ResourceLink};
+use hue::api::{LightEffect, RType, ResourceLink};
 
 use crate::error::{ApiError, ApiResult};
 use crate::model::hass::{HassRoomConfig, HassRuntimeState, HassSwitchMode, HassUiState};
@@ -37,6 +41,8 @@ pub(super) enum HassEntityKind {
     Light,
     Switch,
     BinarySensor,
+    Sensor,
+    Event,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,13 +51,20 @@ pub(super) enum HassServiceKind {
     Switch,
     Motion,
     Contact,
+    Temperature,
+    LightLevel,
+    Button,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct HassLightCapabilities {
     pub supports_brightness: bool,
     pub supports_color: bool,
     pub supports_color_temp: bool,
+    pub supports_effects: bool,
+    pub supports_gradient: bool,
+    pub effect_values: Vec<LightEffect>,
+    pub effect_names: Vec<(LightEffect, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -115,10 +128,15 @@ pub struct HassBackend {
     entity_map: HashMap<String, HassEntityBinding>,
     light_map: HashMap<Uuid, String>,
     sensor_map: HashMap<Uuid, String>,
+    button_map: HashMap<Uuid, String>,
     device_map: HashMap<Uuid, String>,
     room_map: HashMap<String, HassRoomBinding>,
     scene_map: HashMap<Uuid, String>,
+    imported_scene_map: HashMap<Uuid, String>,
     ws: Option<HassWs>,
+    ws_backoff_secs: u64,
+    ws_retry_at: Instant,
+    ws_needs_sync: bool,
 }
 
 impl HassBackend {
@@ -139,10 +157,15 @@ impl HassBackend {
             entity_map: HashMap::new(),
             light_map: HashMap::new(),
             sensor_map: HashMap::new(),
+            button_map: HashMap::new(),
             device_map: HashMap::new(),
             room_map: HashMap::new(),
             scene_map: HashMap::new(),
+            imported_scene_map: HashMap::new(),
             ws: None,
+            ws_backoff_secs: 1,
+            ws_retry_at: Instant::now(),
+            ws_needs_sync: false,
         })
     }
 
@@ -191,12 +214,20 @@ impl HassBackend {
         let url = if runtime_url.trim().is_empty() {
             self.server.url.clone()
         } else {
-            url::Url::parse(runtime_url.trim())?
+            HassRuntimeState::parse_url(&runtime_url)?
         };
 
         if let Some(token) = runtime_token {
             self.client.set_runtime(url, Some(token))?;
             return Ok(());
+        }
+
+        if !runtime_url.trim().is_empty() && !HassRuntimeState::same_origin(&url, &self.server.url)
+        {
+            return Err(ApiError::service_error(format!(
+                "[{}] Runtime Home Assistant URL changed origin; configure a new token",
+                self.name
+            )));
         }
 
         self.client.set_base_url(url);
@@ -238,7 +269,7 @@ impl HassBackend {
     }
 
     async fn ensure_ws_connected(&mut self) {
-        if self.ws.is_some() {
+        if self.ws.is_some() || Instant::now() < self.ws_retry_at {
             return;
         }
 
@@ -252,28 +283,48 @@ impl HassBackend {
 
         if let Err(err) = self.apply_runtime_connection().await {
             log::debug!("[{}] WS connect skipped: {}", self.name, err);
+            self.schedule_ws_retry();
             return;
         }
 
         match self.client.subscribe_state_changed().await {
             Ok(ws) => {
                 self.ws = Some(ws);
+                self.ws_backoff_secs = 1;
+                self.ws_retry_at = Instant::now();
                 self.ui_log("Realtime state sync connected (Home Assistant websocket)")
                     .await;
+
+                if self.ws_needs_sync {
+                    if let Err(err) = self.run_sync("websocket reconnect").await {
+                        log::warn!(
+                            "[{}] Full sync after websocket reconnect failed: {}",
+                            self.name,
+                            err
+                        );
+                        self.ws = None;
+                        self.schedule_ws_retry();
+                    } else {
+                        self.ws_needs_sync = false;
+                    }
+                }
             }
             Err(err) => {
                 log::debug!("[{}] WS connect failed: {}", self.name, err);
+                self.schedule_ws_retry();
             }
         }
     }
 
+    fn schedule_ws_retry(&mut self) {
+        self.ws_retry_at = Instant::now() + Duration::from_secs(self.ws_backoff_secs.min(30));
+        self.ws_backoff_secs = self.ws_backoff_secs.saturating_mul(2).min(30);
+    }
+
     async fn event_loop(&mut self, chan: &mut Receiver<Arc<BackendRequest>>) -> ApiResult<()> {
-        if let Err(err) = self.run_sync("startup").await {
-            log::error!(
-                "[{}] Initial Home Assistant sync failed: {}",
-                self.name,
-                err
-            );
+        self.ws_needs_sync = self.run_sync("startup").await.is_err();
+        if self.ws_needs_sync {
+            log::error!("[{}] Initial Home Assistant sync failed", self.name);
         }
 
         let mut ws_tick = interval(Duration::from_secs(10));
@@ -283,30 +334,45 @@ impl HassBackend {
             if let Some(ws) = &mut self.ws {
                 tokio::select! {
                     _ = ws_tick.tick() => {
-                        self.ensure_ws_connected().await;
+                        if let Err(err) = ws.check_liveness(Duration::from_secs(5)).await {
+                            log::debug!("[{}] WS liveness failed: {}", self.name, err);
+                            self.ws = None;
+                            self.ws_needs_sync = true;
+                            self.schedule_ws_retry();
+                        }
                     }
                     req = chan.recv() => {
                         let req = req?;
-                        self.handle_backend_event(req).await?;
+                        if let Err(err) = self.handle_backend_event(req).await {
+                            log::error!("[{}] backend event failed: {}", self.name, err);
+                        }
                     }
-                    ev = ws.next_state_changed() => {
+                    ev = ws.next_event() => {
                         match ev {
                             Ok(Some(ev)) => {
-                                // Keep fields "used" to avoid -D warnings while still being explicit
-                                // about which parts drive Hue state updates.
-                                let _entity_id = ev.entity_id;
-                                let _old_state = ev.old_state;
-                                if let Some(new_state) = ev.new_state {
-                                    let _ = self.handle_state_update(new_state).await;
+                                if ev.event_type == "state_changed" {
+                                    if let Some(change) = ev.state_changed() {
+                                        if let Some(new_state) = change.new_state {
+                                            let _ = self.handle_state_update(new_state).await;
+                                        } else {
+                                            let _ = self.remove_entity_by_id(&change.entity_id).await;
+                                        }
+                                    }
+                                } else {
+                                    let _ = self.handle_generic_event(&ev.event_type, &ev.data).await;
                                 }
                             }
                             Ok(None) => {
                                 // websocket closed, reconnect later
                                 self.ws = None;
+                                self.ws_needs_sync = true;
+                                self.schedule_ws_retry();
                             }
                             Err(err) => {
                                 log::debug!("[{}] WS error: {}", self.name, err);
                                 self.ws = None;
+                                self.ws_needs_sync = true;
+                                self.schedule_ws_retry();
                             }
                         }
                     }
@@ -318,7 +384,9 @@ impl HassBackend {
                     }
                     req = chan.recv() => {
                         let req = req?;
-                        self.handle_backend_event(req).await?;
+                        if let Err(err) = self.handle_backend_event(req).await {
+                            log::error!("[{}] backend event failed: {}", self.name, err);
+                        }
                     }
                 }
             }

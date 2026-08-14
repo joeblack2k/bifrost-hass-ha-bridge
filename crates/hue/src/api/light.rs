@@ -224,6 +224,14 @@ impl AddAssign<&LightUpdate> for Light {
                 grad.points.clone_from(&grupd.points);
             }
         }
+
+        if let Some(powerup) = &upd.powerup {
+            if powerup.is_null() {
+                self.powerup = None;
+            } else if let Ok(powerup) = serde_json::from_value::<LightPowerup>(powerup.clone()) {
+                self.powerup = Some(powerup);
+            }
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 import type {
   HassBridgeInfo,
   HassRuntimeConfigPublic,
+  BridgeSettingsExport,
   HassUiConfig,
   HassUiPayload,
 } from './types'
@@ -99,6 +100,18 @@ export async function putUiConfig(config: HassUiConfig): Promise<HassUiConfig> {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(config),
+  })
+}
+
+export async function getBridgeSettingsExport(): Promise<BridgeSettingsExport> {
+  return api('/bifrost/hass/settings/export')
+}
+
+export async function importBridgeSettings(value: unknown): Promise<BridgeSettingsExport> {
+  return api('/bifrost/hass/settings/import', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(value),
   })
 }
 

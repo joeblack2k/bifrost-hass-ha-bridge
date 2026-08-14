@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use serde_yml::Value;
 use uuid::Uuid;
 
@@ -15,6 +16,27 @@ use crate::error::{ApiError, ApiResult};
 pub struct AuxData {
     pub topic: Option<String>,
     pub index: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LegacyResourceLink {
+    pub link_type: String,
+    pub name: String,
+    pub description: String,
+    pub classid: u32,
+    pub owner: Uuid,
+    pub recycle: bool,
+    pub links: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LegacyState {
+    #[serde(default)]
+    pub resource_links: BTreeMap<u32, LegacyResourceLink>,
+    #[serde(default)]
+    pub rules: BTreeMap<u32, JsonValue>,
+    #[serde(default)]
+    pub schedules: BTreeMap<u32, JsonValue>,
 }
 
 impl AuxData {
@@ -107,6 +129,8 @@ pub struct State {
     aux: BTreeMap<Uuid, AuxData>,
     id_v1: IdMap,
     pub res: BTreeMap<Uuid, Resource>,
+    #[serde(default)]
+    pub legacy: LegacyState,
 }
 
 impl State {
@@ -189,6 +213,7 @@ impl State {
             aux,
             id_v1,
             res,
+            legacy: LegacyState::default(),
         })
     }
 

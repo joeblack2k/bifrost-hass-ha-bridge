@@ -1,55 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import clsx from 'clsx'
-import { patchEntity, postPatinaEvent, putUiConfig } from './lib/api'
-import type {
-  HassEntitySummary,
-  HassLightArchetype,
-  HassSensorKind,
-  HassSwitchMode,
-  HassUiConfig,
-} from './lib/types'
-import { Panel } from './components/Panel'
-import { TactileButton } from './components/TactileButton'
-import { AboutPage } from './pages/AboutPage'
-import { AdvancedPage } from './pages/AdvancedPage'
-import { BridgePage } from './pages/BridgePage'
-import { EntitiesPage } from './pages/EntitiesPage'
-import { LogsPage } from './pages/LogsPage'
-import { RoomsPage } from './pages/RoomsPage'
-import { SetupPage } from './pages/SetupPage'
-import { PatinaProvider } from './state/PatinaContext'
+import { useEffect, useMemo, useState } from 'react'
+import { postPatinaEvent, postSync, putUiConfig } from './lib/api'
+import type { HassUiConfig } from './lib/types'
+import { AppShell, type ViewId } from './components/AppShell'
 import { ToastProvider, useToast } from './state/ToastContext'
+import { DashboardPage } from './pages/DashboardPage'
+import { InventoryPage } from './pages/InventoryPage'
+import { RoomBuilderPage } from './pages/RoomBuilderPage'
+import { SystemPage } from './pages/SystemPage'
+import { cloneConfig } from './lib/layout'
 import { useBifrostData } from './state/useBifrostData'
-
-type TabId =
-  | 'setup'
-  | 'lights'
-  | 'switches'
-  | 'sensors'
-  | 'hidden'
-  | 'rooms'
-  | 'advanced'
-  | 'bridge'
-  | 'logs'
-  | 'about'
-
-const TABS: Array<{ id: TabId; label: string }> = [
-  { id: 'setup', label: 'Setup' },
-  { id: 'lights', label: 'Lights' },
-  { id: 'switches', label: 'Switches' },
-  { id: 'sensors', label: 'Sensors' },
-  { id: 'hidden', label: 'Hidden' },
-  { id: 'rooms', label: 'Rooms' },
-  { id: 'advanced', label: 'Advanced' },
-  { id: 'bridge', label: 'Bridge' },
-  { id: 'logs', label: 'Logs' },
-  { id: 'about', label: 'About' },
-]
-
-function tabFromHash(hash: string): TabId {
-  const id = hash.replace(/^#/, '').toLowerCase()
-  return (TABS.find((t) => t.id === id)?.id || 'setup') as TabId
-}
 
 function emptyConfig(): HassUiConfig {
   return {
@@ -57,7 +16,7 @@ function emptyConfig(): HassUiConfig {
     exclude_entity_ids: [],
     exclude_name_patterns: [],
     include_unavailable: true,
-    rooms: [],
+    rooms: [{ id: 'home-assistant', name: 'Home Assistant', source_area: null, auto_created: false }],
     entity_preferences: {},
     ignored_area_names: [],
     default_add_new_devices_to_hue: false,
@@ -80,271 +39,104 @@ function emptyConfig(): HassUiConfig {
   }
 }
 
-function AppContent(props: { data: ReturnType<typeof useBifrostData> }) {
-  const data = props.data
-  const toast = useToast()
+function viewFromHash(hash: string): ViewId {
+  const value = hash.replace(/^#/, '').toLowerCase()
+  if (value === 'rooms' || value === 'lights' || value === 'switches' || value === 'sensors' || value === 'hidden') return value === 'rooms' ? 'builder' : 'inventory'
+  if (value === 'setup' || value === 'advanced' || value === 'bridge' || value === 'logs' || value === 'about') return 'system'
+  return value === 'builder' || value === 'inventory' || value === 'system' ? value : 'overview'
+}
 
-  const [tab, setTab] = useState<TabId>(() => tabFromHash(window.location.hash))
-  const aliasDebounce = useRef<Map<string, number>>(new Map())
+function AppContent() {
+  const data = useBifrostData()
+  const toast = useToast()
+  const [view, setView] = useState<ViewId>(() => viewFromHash(window.location.hash))
+  const [draft, setDraft] = useState<HassUiConfig | null>(null)
+  const [dirty, setDirty] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  const liveConfig = data.payload?.config || emptyConfig()
+  const config = draft || liveConfig
+  const entities = data.payload?.entities || []
+  const runtimeConnected = !!data.runtime?.enabled && !!data.runtime.token_present
 
   useEffect(() => {
-    const onHash = () => setTab(tabFromHash(window.location.hash))
+    const onHash = () => setView(viewFromHash(window.location.hash))
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
 
   useEffect(() => {
-    const timers = aliasDebounce.current
-    return () => {
-      for (const timeout of timers.values()) {
-        window.clearTimeout(timeout)
-      }
-      timers.clear()
+    if (!dirty && data.payload?.config) {
+      // The background poll is allowed to update the draft only while the user is not editing.
+      setDraft(cloneConfig(data.payload.config))
     }
-  }, [])
+  }, [data.payload?.config, dirty])
 
-  const payload = data.payload
-  const config = payload?.config || emptyConfig()
-  const entities = useMemo(() => payload?.entities || [], [payload?.entities])
-  const rooms = config.rooms || []
+  const counts = useMemo(() => ({
+    rooms: config.rooms.length,
+    entities: entities.length,
+  }), [config.rooms.length, entities.length])
 
-  const counters = useMemo(() => {
-    const lights = entities.filter((e) => e.domain === 'light').length
-    const switches = entities.filter((e) => e.domain === 'switch').length
-    const sensors = entities.filter((e) => e.domain === 'binary_sensor').length
-    const hidden = entities.filter((e) => !e.included).length
-    return { lights, switches, sensors, hidden }
-  }, [entities])
+  function navigate(next: ViewId) {
+    setView(next)
+    window.location.hash = next
+  }
 
-  async function callWithToast(okText: string, fn: () => Promise<void>) {
+  function changeDraft(next: HassUiConfig) {
+    setDraft(cloneConfig(next))
+    setDirty(true)
+  }
+
+  async function saveDraft() {
+    if (!draft || saving) return
+    setSaving(true)
     try {
-      await fn()
+      const saved = await putUiConfig(draft)
+      await postSync()
+      await postPatinaEvent('apply', 'room-builder-save').catch(() => {})
+      setDraft(cloneConfig(saved))
+      setDirty(false)
       data.refresh()
-      toast.push(okText, 'good')
-    } catch (err) {
-      toast.push(err instanceof Error ? err.message : String(err), 'bad')
+      toast.push('Room layout saved. Sync queued for Hue.', 'good')
+    } catch (error) {
+      toast.push(error instanceof Error ? error.message : String(error), 'bad')
+    } finally {
+      setSaving(false)
     }
   }
 
-  async function saveConfig(next: HassUiConfig) {
-    await callWithToast('Configuration saved', async () => {
+  function discardDraft() {
+    setDraft(cloneConfig(liveConfig))
+    setDirty(false)
+    toast.push('Draft discarded.', 'neutral')
+  }
+
+  async function saveSystemConfig(next: HassUiConfig) {
+    try {
       await putUiConfig(next)
-      await postPatinaEvent('apply', 'save-config').catch(() => {})
-    })
-  }
-
-  function setIncluded(entity: HassEntitySummary, included: boolean) {
-    void callWithToast(`${included ? 'Added to Hue' : 'Hidden from Hue'}: ${entity.entity_id}`, async () => {
-      await patchEntity(entity.entity_id, { hidden: !included })
-      await postPatinaEvent('toggle', `included:${entity.entity_id}`).catch(() => {})
-    })
-  }
-
-  function setRoom(entity: HassEntitySummary, roomId: string) {
-    void callWithToast(`Room updated: ${entity.entity_id}`, async () => {
-      await patchEntity(entity.entity_id, { room_id: roomId })
-      await postPatinaEvent('toggle', `room:${entity.entity_id}`).catch(() => {})
-    })
-  }
-
-  function setAlias(entity: HassEntitySummary, alias: string) {
-    const key = entity.entity_id
-    const existing = aliasDebounce.current.get(key)
-    if (existing) {
-      window.clearTimeout(existing)
+      await postSync()
+      data.refresh()
+      toast.push('System preference saved. Sync queued.', 'good')
+    } catch (error) {
+      toast.push(error instanceof Error ? error.message : String(error), 'bad')
     }
-    const timeout = window.setTimeout(() => {
-      aliasDebounce.current.delete(key)
-      void callWithToast(`Alias saved: ${entity.entity_id}`, async () => {
-        await patchEntity(entity.entity_id, { alias })
-        await postPatinaEvent('click', `alias:${entity.entity_id}`).catch(() => {})
-      })
-    }, 350)
-    aliasDebounce.current.set(key, timeout)
   }
 
-  function setSensorKind(entity: HassEntitySummary, kind: HassSensorKind) {
-    void callWithToast(`Sensor type updated: ${entity.entity_id}`, async () => {
-      await patchEntity(entity.entity_id, { sensor_kind: kind })
-      await postPatinaEvent('toggle', `sensor-kind:${entity.entity_id}`).catch(() => {})
-    })
+  function systemMessage(message: string, tone: 'good' | 'warn' | 'bad') {
+    toast.push(message, tone)
   }
 
-  function setSensorEnabled(entity: HassEntitySummary, enabled: boolean) {
-    void callWithToast(`Sensor ${enabled ? 'enabled' : 'disabled'}: ${entity.entity_id}`, async () => {
-      await patchEntity(entity.entity_id, { enabled })
-      await postPatinaEvent('toggle', `sensor-enabled:${entity.entity_id}`).catch(() => {})
-    })
-  }
-
-  function setSwitchMode(entity: HassEntitySummary, mode: HassSwitchMode) {
-    void callWithToast(`Switch mode updated: ${entity.entity_id}`, async () => {
-      await patchEntity(entity.entity_id, { switch_mode: mode })
-      await postPatinaEvent('toggle', `switch-mode:${entity.entity_id}`).catch(() => {})
-    })
-  }
-
-  function setLightArchetype(entity: HassEntitySummary, archetype: HassLightArchetype) {
-    void callWithToast(`Light icon updated: ${entity.entity_id}`, async () => {
-      await patchEntity(entity.entity_id, { light_archetype: archetype })
-      await postPatinaEvent('toggle', `light-archetype:${entity.entity_id}`).catch(() => {})
-    })
-  }
-
-  return (
-    <div className="mx-auto max-w-[1400px] px-2 pb-10 pt-2 sm:px-4 sm:pt-4">
-      <header className="sticky top-2 z-20 mb-3">
-        <Panel
-          title="Bifrost HA Bridge"
-          subtitle="Direct control for what appears in the Hue app."
-          right={
-            <TactileButton variant="neutral" onClick={data.refresh} wearKey="app:refresh">
-              Refresh
-            </TactileButton>
-          }
-        >
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {TABS.map((t) => (
-              <button
-                key={t.id}
-                type="button"
-                onClick={() => {
-                  setTab(t.id)
-                  window.location.hash = t.id
-                }}
-                className={clsx(
-                  'tactile-control fingerprint rounded-full px-2.5 py-1 text-[11px] font-semibold tracking-[0.06em] uppercase',
-                  tab === t.id
-                    ? 'bg-[linear-gradient(180deg,rgba(90,135,220,0.95),rgba(35,75,165,0.96))] text-white'
-                    : 'text-ink-0',
-                )}
-              >
-                {t.label}
-                {t.id === 'lights' && counters.lights > 0 ? ` (${counters.lights})` : ''}
-                {t.id === 'switches' && counters.switches > 0 ? ` (${counters.switches})` : ''}
-                {t.id === 'sensors' && counters.sensors > 0 ? ` (${counters.sensors})` : ''}
-                {t.id === 'hidden' && counters.hidden > 0 ? ` (${counters.hidden})` : ''}
-              </button>
-            ))}
-          </div>
-
-          {data.error ? (
-            <div className="mt-3 rounded-control border border-[rgba(205,72,74,0.55)] bg-[rgba(205,72,74,0.15)] px-3 py-2 text-sm text-ink-0">
-              API error: {data.error}
-            </div>
-          ) : null}
-        </Panel>
-      </header>
-
-      {data.loading && !payload ? (
-        <Panel title="Loading" subtitle="Fetching bridge state...">
-          <div className="text-sm text-ink-1/70">Please wait.</div>
-        </Panel>
-      ) : (
-        <main>
-          {tab === 'setup' && (
-            <SetupPage
-              runtime={data.runtime}
-              config={config}
-              onSaveConfig={saveConfig}
-              onRefresh={data.refresh}
-            />
-          )}
-
-          {tab === 'lights' && (
-            <EntitiesPage
-              title="Lights"
-              subtitle="Home Assistant light entities exposed as Hue lights."
-              entities={entities}
-              rooms={rooms}
-              predicate={(e) => e.domain === 'light'}
-              onSetIncluded={setIncluded}
-              onSetRoom={setRoom}
-              onSetAlias={setAlias}
-              onSetSensorKind={setSensorKind}
-              onSetSensorEnabled={setSensorEnabled}
-              onSetSwitchMode={setSwitchMode}
-              onSetLightArchetype={setLightArchetype}
-            />
-          )}
-
-          {tab === 'switches' && (
-            <EntitiesPage
-              title="Switches"
-              subtitle="Home Assistant switches with selectable Hue type (plug or light)."
-              entities={entities}
-              rooms={rooms}
-              predicate={(e) => e.domain === 'switch'}
-              onSetIncluded={setIncluded}
-              onSetRoom={setRoom}
-              onSetAlias={setAlias}
-              onSetSensorKind={setSensorKind}
-              onSetSensorEnabled={setSensorEnabled}
-              onSetSwitchMode={setSwitchMode}
-              onSetLightArchetype={setLightArchetype}
-            />
-          )}
-
-          {tab === 'sensors' && (
-            <EntitiesPage
-              title="Sensors"
-              subtitle="Binary sensors mapped as Hue motion/contact sensors."
-              entities={entities}
-              rooms={rooms}
-              predicate={(e) => e.domain === 'binary_sensor'}
-              onSetIncluded={setIncluded}
-              onSetRoom={setRoom}
-              onSetAlias={setAlias}
-              onSetSensorKind={setSensorKind}
-              onSetSensorEnabled={setSensorEnabled}
-              onSetSwitchMode={setSwitchMode}
-              onSetLightArchetype={setLightArchetype}
-            />
-          )}
-
-          {tab === 'hidden' && (
-            <EntitiesPage
-              title="Hidden"
-              subtitle="All entities currently not exposed in Hue."
-              entities={entities}
-              rooms={rooms}
-              predicate={(e) => !e.included}
-              onSetIncluded={setIncluded}
-              onSetRoom={setRoom}
-              onSetAlias={setAlias}
-              onSetSensorKind={setSensorKind}
-              onSetSensorEnabled={setSensorEnabled}
-              onSetSwitchMode={setSwitchMode}
-              onSetLightArchetype={setLightArchetype}
-            />
-          )}
-
-          {tab === 'rooms' && (
-            <RoomsPage config={config} onSaveConfig={saveConfig} onRefresh={data.refresh} />
-          )}
-
-          {tab === 'advanced' && <AdvancedPage config={config} onSaveConfig={saveConfig} />}
-
-          {tab === 'bridge' && payload && (
-            <BridgePage payload={payload} bridge={data.bridge} onRefresh={data.refresh} />
-          )}
-
-          {tab === 'logs' && <LogsPage logs={payload?.logs || []} onRefresh={data.refresh} />}
-
-          {tab === 'about' && <AboutPage bridge={data.bridge} patina={payload?.patina} />}
-        </main>
-      )}
-    </div>
-  )
+  return <AppShell view={view} onNavigate={navigate} runtimeConnected={runtimeConnected} entityCount={counts.entities} roomCount={counts.rooms} dirty={dirty} saving={saving} onSave={() => void saveDraft()} onDiscard={discardDraft} onRefresh={data.refresh} error={data.error}>
+    {data.loading && !data.payload ? <div className="loading-state"><div className="loading-spinner" /><h2>Connecting to Bifrost</h2><p>Reading your Home Assistant bridge state…</p></div> : null}
+    {!data.loading || data.payload ? <>
+      {view === 'overview' ? <DashboardPage config={config} entities={entities} runtime={data.runtime} bridge={data.bridge} onNavigate={navigate} /> : null}
+      {view === 'builder' ? <RoomBuilderPage config={config} entities={entities} onChange={changeDraft} /> : null}
+      {view === 'inventory' ? <InventoryPage config={config} entities={entities} onChange={changeDraft} /> : null}
+      {view === 'system' ? <SystemPage runtime={data.runtime} config={liveConfig} bridge={data.bridge} logs={data.payload?.logs || []} onSaveConfig={saveSystemConfig} onRefresh={data.refresh} onMessage={systemMessage} /> : null}
+    </> : null}
+  </AppShell>
 }
 
 export default function App() {
-  const data = useBifrostData()
-  return (
-    <ToastProvider>
-      <PatinaProvider patina={data.payload?.patina}>
-        <AppContent data={data} />
-      </PatinaProvider>
-    </ToastProvider>
-  )
+  return <ToastProvider><AppContent /></ToastProvider>
 }

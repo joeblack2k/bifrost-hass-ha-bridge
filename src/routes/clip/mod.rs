@@ -1,3 +1,4 @@
+pub mod behavior;
 pub mod device;
 pub mod entertainment_configuration;
 pub mod grouped_light;
@@ -5,6 +6,7 @@ pub mod light;
 pub mod room;
 pub mod scene;
 pub mod sensor;
+pub mod topology;
 pub mod zigbee_device_discovery;
 
 use bifrost_api::backend::BackendRequest;
@@ -82,16 +84,15 @@ async fn post_resource(
     log::debug!("Json data:\n{}", serde_json::to_string_pretty(&req)?);
 
     match rtype {
+        RType::BehaviorInstance => behavior::post_behavior_instance(&state, req).await,
         RType::EntertainmentConfiguration => ent_conf::post_resource(&state, req).await,
         RType::Scene => scene::post_scene(&state, req).await,
+        RType::ServiceGroup => topology::post_service_group(&state, req).await,
+        RType::SmartScene => topology::post_smart_scene(&state, req).await,
+        RType::Zone => topology::post_zone(&state, req).await,
 
         /* Not supported yet by Bifrost */
-        RType::BehaviorInstance
-        | RType::GeofenceClient
-        | RType::Room
-        | RType::ServiceGroup
-        | RType::SmartScene
-        | RType::Zone => {
+        RType::GeofenceClient | RType::Room => {
             let err = ApiError::CreateNotYetSupported(rtype);
             log::warn!("{err}");
             Err(err)
@@ -153,6 +154,7 @@ async fn put_resource_id(
 
     match rlink.rtype {
         /* Allowed + supported */
+        RType::BehaviorInstance => behavior::put_behavior_instance(&state, rlink, put).await,
         RType::Device => device::put_device(&state, rlink, put).await,
         RType::EntertainmentConfiguration => ent_conf::put_resource_id(&state, rlink, put).await,
         RType::GroupedLight => grouped_light::put_grouped_light(&state, rlink, put).await,
@@ -160,13 +162,15 @@ async fn put_resource_id(
         RType::Motion | RType::Contact => sensor::put_sensor(&state, rlink, put).await,
         RType::Scene => scene::put_scene(&state, rlink, put).await,
         RType::Room => room::put_room(&state, rlink, put).await,
+        RType::ServiceGroup => topology::put_service_group(&state, rlink, put).await,
+        RType::SmartScene => topology::put_smart_scene(&state, rlink, put).await,
+        RType::Zone => topology::put_zone(&state, rlink, put).await,
         RType::ZigbeeDeviceDiscovery => {
             zigbee_device_discovery::put_zigbee_device_discovery(&state, rlink, put).await
         }
 
         /* Allowed, but support is missing in Bifrost */
-        RType::BehaviorInstance
-        | RType::Bridge
+        RType::Bridge
         | RType::Button
         | RType::CameraMotion
         | RType::DevicePower
@@ -181,12 +185,9 @@ async fn put_resource_id(
         | RType::LightLevel
         | RType::Matter
         | RType::RelativeRotary
-        | RType::ServiceGroup
-        | RType::SmartScene
         | RType::Temperature
         | RType::ZgpConnectivity
-        | RType::ZigbeeConnectivity
-        | RType::Zone => {
+        | RType::ZigbeeConnectivity => {
             /* check that the resource exists, otherwise we should return 404 */
             state.res.lock().await.get_resource(&rlink)?;
 
@@ -218,17 +219,19 @@ async fn delete_resource_id(
     log::info!("DELETE {rlink:?}");
 
     match rlink.rtype {
+        /* Allowed (handled locally) */
+        RType::BehaviorInstance => behavior::delete_behavior_instance(&state, rlink).await,
+        RType::ServiceGroup | RType::SmartScene | RType::Zone => {
+            topology::delete(&state, rlink).await
+        }
+
         /* Allowed (send request to backend) */
-        RType::BehaviorInstance
-        | RType::Device
+        RType::Device
         | RType::EntertainmentConfiguration
         | RType::GeofenceClient
         | RType::MatterFabric
         | RType::Room
-        | RType::Scene
-        | RType::ServiceGroup
-        | RType::SmartScene
-        | RType::Zone => {
+        | RType::Scene => {
             let lock = state.res.lock().await;
 
             /* check that the resource exists, otherwise we should return 404 */

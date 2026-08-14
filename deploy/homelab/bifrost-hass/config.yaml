@@ -1,7 +1,8 @@
 bifrost:
   state_file: "data/state.yaml"
   cert_file: "data/certs/cert.pem"
-  hass_ui_file: "hass-ui.yaml"
+  hass_ui_file: "data/hass-ui.yaml"
+  hass_runtime_file: "data/hass-runtime.yaml"
 
 bridge:
   name: Bifrost-HASS
