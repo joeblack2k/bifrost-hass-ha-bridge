@@ -1,6 +1,7 @@
 mod backend_event;
 mod client;
 mod import;
+mod projections;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ pub(super) enum HassEntityKind {
     Light,
     Switch,
     BinarySensor,
+    Sensor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +47,8 @@ pub(super) enum HassServiceKind {
     Switch,
     Motion,
     Contact,
+    Temperature,
+    LightLevel,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

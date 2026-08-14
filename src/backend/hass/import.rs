@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 
 use hue::api::{
     ColorTemperature, Device, DeviceArchetype, DeviceProductData, Dimming, DimmingUpdate,
-    GroupedLight, Light, LightColor, LightDynamics, LightDynamicsStatus, LightMetadata, Metadata,
-    MirekSchema, Motion, On, RType, Resource, ResourceLink, Room, RoomArchetype, RoomMetadata,
-    ZigbeeConnectivity, ZigbeeConnectivityStatus,
+    GroupedLight, Light, LightColor, LightDynamics, LightDynamicsStatus, LightLevel, LightMetadata,
+    Metadata, MirekSchema, Motion, On, RType, Resource, ResourceLink, Room, RoomArchetype,
+    RoomMetadata, Temperature, ZigbeeConnectivity, ZigbeeConnectivityStatus,
 };
 use hue::colortemp::kelvin_to_mirek;
 use hue::xy::XY;
@@ -24,6 +24,8 @@ use crate::model::hass::{
     HassEntitySummary, HassLightArchetype, HassSensorKind, HassSwitchMode, HassUiConfig,
 };
 use crate::resource::Resources;
+
+use super::projections;
 
 #[derive(Clone, Debug)]
 struct ImportedEntity {
@@ -43,6 +45,7 @@ struct ImportedEntity {
     sensor_enabled: bool,
     switch_mode: Option<HassSwitchMode>,
     light_archetype: Option<HassLightArchetype>,
+    sensor_value: Option<f64>,
 }
 
 impl ImportedEntity {
@@ -51,6 +54,7 @@ impl ImportedEntity {
             HassEntityKind::Light => "light",
             HassEntityKind::Switch => "switch",
             HassEntityKind::BinarySensor => "binary_sensor",
+            HassEntityKind::Sensor => "sensor",
         }
     }
 
@@ -66,6 +70,8 @@ impl ImportedEntity {
             }
             HassServiceKind::Motion => "motion".to_string(),
             HassServiceKind::Contact => "contact".to_string(),
+            HassServiceKind::Temperature => "temperature".to_string(),
+            HassServiceKind::LightLevel => "light_level".to_string(),
         }
     }
 }
@@ -190,6 +196,15 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
                 Some(detected),
             )
         }
+        "sensor" => {
+            let service_kind = projections::classify_sensor(state)?;
+            (
+                HassEntityKind::Sensor,
+                service_kind,
+                HassLightCapabilities::default(),
+                None,
+            )
+        }
         _ => return None,
     };
 
@@ -255,6 +270,9 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
             None
         },
         light_archetype: None,
+        sensor_value: matches!(kind, HassEntityKind::Sensor)
+            .then(|| projections::numeric_value(state))
+            .flatten(),
     })
 }
 
@@ -305,6 +323,7 @@ fn light_archetype(imported: &ImportedEntity) -> DeviceArchetype {
             }
         }
         HassEntityKind::BinarySensor => DeviceArchetype::UnknownArchetype,
+        HassEntityKind::Sensor => DeviceArchetype::UnknownArchetype,
     }
 }
 
@@ -399,7 +418,7 @@ fn apply_light_state(light: &mut Light, imported: &ImportedEntity) {
                 light.color_temperature_delta = None;
             }
         }
-        HassEntityKind::Switch | HassEntityKind::BinarySensor => {
+        HassEntityKind::Switch | HassEntityKind::BinarySensor | HassEntityKind::Sensor => {
             light.dimming = None;
             light.color = None;
             light.color_temperature = None;
@@ -427,7 +446,7 @@ fn apply_light_state(light: &mut Light, imported: &ImportedEntity) {
             speed: 0.0,
             speed_valid: false,
         }),
-        HassEntityKind::Switch | HassEntityKind::BinarySensor => None,
+        HassEntityKind::Switch | HassEntityKind::BinarySensor | HassEntityKind::Sensor => None,
     };
 }
 
@@ -456,6 +475,12 @@ impl HassBackend {
             }
             HassServiceKind::Motion => RType::Motion.deterministic(format!("{key}:motion")),
             HassServiceKind::Contact => RType::Contact.deterministic(format!("{key}:contact")),
+            HassServiceKind::Temperature => {
+                RType::Temperature.deterministic(format!("{key}:temperature"))
+            }
+            HassServiceKind::LightLevel => {
+                RType::LightLevel.deterministic(format!("{key}:light_level"))
+            }
         };
         (
             RType::Device.deterministic(format!("{key}:device")),
@@ -647,7 +672,10 @@ impl HassBackend {
                     .insert(binding.service_link.rid, imported.entity_id.clone());
                 self.sensor_map.remove(&binding.service_link.rid);
             }
-            HassServiceKind::Motion | HassServiceKind::Contact => {
+            HassServiceKind::Motion
+            | HassServiceKind::Contact
+            | HassServiceKind::Temperature
+            | HassServiceKind::LightLevel => {
                 self.sensor_map
                     .insert(binding.service_link.rid, imported.entity_id.clone());
                 self.light_map.remove(&binding.service_link.rid);
@@ -731,6 +759,50 @@ impl HassBackend {
                 }
                 res.add(&binding.service_link, Resource::Contact(value))?;
             }
+            HassServiceKind::Temperature => {
+                let value = projections::resource_payload(
+                    imported.service_kind,
+                    imported.sensor_value,
+                    imported.available,
+                );
+                if res.get::<Temperature>(&binding.service_link).is_err() {
+                    res.add(
+                        &binding.service_link,
+                        Resource::Temperature(Temperature {
+                            enabled: imported.sensor_enabled,
+                            owner: binding.device_link,
+                            temperature: value,
+                        }),
+                    )?;
+                } else {
+                    res.update::<Temperature>(&binding.service_link.rid, |temperature| {
+                        temperature.enabled = imported.sensor_enabled;
+                        temperature.temperature = value.clone();
+                    })?;
+                }
+            }
+            HassServiceKind::LightLevel => {
+                let value = projections::resource_payload(
+                    imported.service_kind,
+                    imported.sensor_value,
+                    imported.available,
+                );
+                if res.get::<LightLevel>(&binding.service_link).is_err() {
+                    res.add(
+                        &binding.service_link,
+                        Resource::LightLevel(LightLevel {
+                            enabled: imported.sensor_enabled,
+                            owner: binding.device_link,
+                            light: value,
+                        }),
+                    )?;
+                } else {
+                    res.update::<LightLevel>(&binding.service_link.rid, |light_level| {
+                        light_level.enabled = imported.sensor_enabled;
+                        light_level.light = value.clone();
+                    })?;
+                }
+            }
         }
 
         Ok(())
@@ -797,6 +869,7 @@ impl HassBackend {
                         binding.switch_mode.unwrap_or(HassSwitchMode::Plug) == HassSwitchMode::Light
                     }
                     HassEntityKind::BinarySensor => false,
+                    HassEntityKind::Sensor => false,
                 };
                 if !grouped_as_light {
                     continue;
@@ -939,6 +1012,11 @@ impl HassBackend {
                         HassSensorKind::Contact => HassServiceKind::Contact,
                         HassSensorKind::Ignore => imported.service_kind,
                     };
+            }
+            if matches!(
+                imported.kind,
+                HassEntityKind::BinarySensor | HassEntityKind::Sensor
+            ) {
                 imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
             }
 
@@ -948,7 +1026,10 @@ impl HassBackend {
             let selected_sensor_kind = match imported.service_kind {
                 HassServiceKind::Motion => Some(HassSensorKind::Motion),
                 HassServiceKind::Contact => Some(HassSensorKind::Contact),
-                HassServiceKind::Light | HassServiceKind::Switch => None,
+                HassServiceKind::Light
+                | HassServiceKind::Switch
+                | HassServiceKind::Temperature
+                | HassServiceKind::LightLevel => None,
             };
 
             let mut included =
@@ -1145,6 +1226,11 @@ impl HassBackend {
                 HassSensorKind::Contact => HassServiceKind::Contact,
                 HassSensorKind::Ignore => imported.service_kind,
             };
+        }
+        if matches!(
+            imported.kind,
+            HassEntityKind::BinarySensor | HassEntityKind::Sensor
+        ) {
             imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
         }
 
@@ -1235,6 +1321,11 @@ impl HassBackend {
                 HassSensorKind::Contact => HassServiceKind::Contact,
                 HassSensorKind::Ignore => imported.service_kind,
             };
+        }
+        if matches!(
+            imported.kind,
+            HassEntityKind::BinarySensor | HassEntityKind::Sensor
+        ) {
             imported.sensor_enabled = ui_config.sensor_enabled(&imported.entity_id);
         }
 
@@ -1271,6 +1362,7 @@ impl HassBackend {
 mod tests {
     use super::{apply_light_state, parse_imported_entity};
     use crate::backend::hass::client::HassState;
+    use crate::backend::hass::{HassEntityKind, HassServiceKind};
     use hue::api::{DeviceArchetype, Light, LightMetadata, RType};
     use serde_json::json;
 
@@ -1311,6 +1403,28 @@ mod tests {
 
         let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
         assert_eq!(imported.color_temp, Some(400));
+    }
+
+    #[test]
+    fn imports_supported_numeric_sensor_without_turning_it_into_a_light() {
+        let state = HassState {
+            entity_id: "sensor.room_temperature".to_string(),
+            state: "21.5".to_string(),
+            attributes: json!({
+                "friendly_name": "Room temperature",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C"
+            })
+            .as_object()
+            .cloned()
+            .expect("object attributes"),
+        };
+
+        let imported = parse_imported_entity(&state, None).expect("numeric sensor");
+        assert_eq!(imported.kind, HassEntityKind::Sensor);
+        assert_eq!(imported.service_kind, HassServiceKind::Temperature);
+        assert_eq!(imported.mapped_type(), "temperature");
+        assert_eq!(imported.sensor_value, Some(21.5));
     }
 
     #[test]

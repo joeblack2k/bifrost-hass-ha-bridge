@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use bifrost_api::backend::BackendRequest;
-use hue::api::{Motion, RType, ResourceLink};
+use hue::api::{LightLevel, Motion, RType, ResourceLink, Temperature};
 
 use crate::error::ApiError;
 use crate::routes::V2Reply;
@@ -28,12 +28,13 @@ pub async fn put_sensor(state: &AppState, rlink: ResourceLink, put: Value) -> Ap
     let enabled = parse_enabled(&put)?;
 
     let mut lock = state.res.lock().await;
-    match rlink.rtype {
+    let notify_backend = match rlink.rtype {
         RType::Motion => {
             let _ = lock.get::<Motion>(&rlink)?;
             lock.update::<Motion>(&rlink.rid, |motion| {
                 motion.enabled = enabled;
             })?;
+            true
         }
         RType::Contact => {
             let record = lock.get_resource(&rlink)?;
@@ -46,11 +47,26 @@ pub async fn put_sensor(state: &AppState, rlink: ResourceLink, put: Value) -> Ap
             }
             let _ = lock.delete(&rlink);
             lock.add(&rlink, hue::api::Resource::Contact(raw))?;
+            true
+        }
+        RType::Temperature => {
+            lock.update::<Temperature>(&rlink.rid, |temperature| {
+                temperature.enabled = enabled;
+            })?;
+            true
+        }
+        RType::LightLevel => {
+            lock.update::<LightLevel>(&rlink.rid, |light_level| {
+                light_level.enabled = enabled;
+            })?;
+            true
         }
         _ => return Err(ApiError::UpdateNotYetSupported(rlink.rtype)),
-    }
+    };
 
-    lock.backend_request(BackendRequest::SensorEnabledUpdate(rlink, enabled))?;
+    if notify_backend {
+        lock.backend_request(BackendRequest::SensorEnabledUpdate(rlink, enabled))?;
+    }
     drop(lock);
 
     V2Reply::ok(rlink)

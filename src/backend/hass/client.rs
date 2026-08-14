@@ -318,7 +318,7 @@ impl HassClient {
     pub async fn get_entity_areas(&self) -> ApiResult<HashMap<String, String>> {
         // Returns one line per entity in format: entity_id|area_name
         let template = r#"
-{% for s in states if s.entity_id.startswith('light.') or s.entity_id.startswith('switch.') or s.entity_id.startswith('binary_sensor.') %}
+{% for s in states if s.entity_id.startswith('light.') or s.entity_id.startswith('switch.') or s.entity_id.startswith('binary_sensor.') or s.entity_id.startswith('sensor.') %}
 {{ s.entity_id }}|{{ area_name(s.entity_id) or '' }}
 {% endfor %}
 "#;

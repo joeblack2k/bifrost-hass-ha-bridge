@@ -115,7 +115,7 @@ impl HassBackend {
                         .await?;
                 }
             }
-            HassEntityKind::BinarySensor => {}
+            HassEntityKind::BinarySensor | HassEntityKind::Sensor => {}
         }
 
         Ok(())
@@ -156,20 +156,28 @@ impl HassBackend {
                     }
                 }
             }
-            HassServiceKind::Light | HassServiceKind::Switch => {}
+            HassServiceKind::Light
+            | HassServiceKind::Switch
+            | HassServiceKind::Temperature
+            | HassServiceKind::LightLevel => {}
         }
         drop(lock);
 
-        if let Err(err) = self
-            .client
-            .set_entity_registry_disabled(&binding.entity_id, !enabled)
-            .await
-        {
-            self.ui_log(format!(
-                "HA entity registry update failed for {}: {}",
-                binding.entity_id, err
-            ))
-            .await;
+        if matches!(
+            binding.service_kind,
+            HassServiceKind::Motion | HassServiceKind::Contact
+        ) {
+            if let Err(err) = self
+                .client
+                .set_entity_registry_disabled(&binding.entity_id, !enabled)
+                .await
+            {
+                self.ui_log(format!(
+                    "HA entity registry update failed for {}: {}",
+                    binding.entity_id, err
+                ))
+                .await;
+            }
         }
 
         Ok(())
@@ -208,6 +216,7 @@ impl HassBackend {
                         binding.switch_mode.unwrap_or(HassSwitchMode::Plug) == HassSwitchMode::Light
                     }
                     HassEntityKind::BinarySensor => false,
+                    HassEntityKind::Sensor => false,
                 };
                 if grouped_as_light {
                     self.backend_light_update(&binding, &light_upd).await?;
@@ -244,6 +253,7 @@ impl HassBackend {
                                 == HassSwitchMode::Light
                         }
                         HassEntityKind::BinarySensor => false,
+                        HassEntityKind::Sensor => false,
                     })
                     .map(|binding| binding.entity_id)
                     .collect::<Vec<_>>()

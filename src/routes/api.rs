@@ -23,8 +23,8 @@ use hue::error::{HueApiV1Error, HueError, HueResult};
 use hue::legacy_api::{
     ApiGroup, ApiGroupAction, ApiGroupActionUpdate, ApiGroupClass, ApiGroupNew, ApiGroupState,
     ApiGroupType, ApiGroupUpdate2, ApiLight, ApiLightStateUpdate, ApiResourceType, ApiScene,
-    ApiSceneAppData, ApiSceneType, ApiSceneVersion, ApiSensor, ApiUserConfig, Capabilities,
-    HueApiResult, NewUser, NewUserReply,
+    ApiSceneAppData, ApiSceneType, ApiSceneVersion, ApiUserConfig, Capabilities, HueApiResult,
+    NewUser, NewUserReply,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -32,6 +32,7 @@ use crate::resource::Resources;
 use crate::routes::auth::{STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY};
 use crate::routes::clip::entertainment_configuration::{self, POSITIONS};
 use crate::routes::extractor::Json;
+use crate::routes::v1_sensors;
 use crate::routes::{ApiV1Error, ApiV1Result};
 use crate::server::appstate::AppState;
 
@@ -234,7 +235,7 @@ async fn get_api_user(
         rules: HashMap::new(),
         scenes: get_scenes(&username, &lock)?,
         schedules: HashMap::new(),
-        sensors: HashMap::from([(1, ApiSensor::builtin_daylight_sensor())]),
+        sensors: v1_sensors::get_sensors(&lock)?,
     }))
 }
 
@@ -248,10 +249,10 @@ async fn get_api_user_resource(
         ApiResourceType::Lights => Ok(Json(json!(get_lights(lock)?))),
         ApiResourceType::Groups => Ok(Json(json!(get_groups(lock, false)?))),
         ApiResourceType::Scenes => Ok(Json(json!(get_scenes(&username, lock)?))),
-        ApiResourceType::Resourcelinks
-        | ApiResourceType::Rules
-        | ApiResourceType::Schedules
-        | ApiResourceType::Sensors => Ok(Json(json!({}))),
+        ApiResourceType::Resourcelinks | ApiResourceType::Rules | ApiResourceType::Schedules => {
+            Ok(Json(json!({})))
+        }
+        ApiResourceType::Sensors => Ok(Json(json!(v1_sensors::get_sensors(lock)?))),
         ApiResourceType::Capabilities => Ok(Json(json!(Capabilities::new()))),
     }
 }

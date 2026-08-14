@@ -21,6 +21,7 @@ pub mod extractor;
 pub mod licenses;
 pub mod updater;
 pub mod upnp;
+pub mod v1_sensors;
 
 #[derive(Error, Debug)]
 pub enum ApiV1Error {
