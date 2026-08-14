@@ -9,6 +9,7 @@ const DOMAIN_ICON: Record<string, IconName> = {
   light: 'lamp',
   switch: 'square',
   binary_sensor: 'circle',
+  scene: 'spark',
 }
 
 export function EntityCard(props: {

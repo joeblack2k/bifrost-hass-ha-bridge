@@ -64,6 +64,7 @@ pub(super) struct HassLightCapabilities {
     pub supports_effects: bool,
     pub supports_gradient: bool,
     pub effect_values: Vec<LightEffect>,
+    pub effect_names: Vec<(LightEffect, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -350,8 +351,12 @@ impl HassBackend {
                         match ev {
                             Ok(Some(ev)) => {
                                 if ev.event_type == "state_changed" {
-                                    if let Some(new_state) = ev.state_changed() {
-                                        let _ = self.handle_state_update(new_state).await;
+                                    if let Some(change) = ev.state_changed() {
+                                        if let Some(new_state) = change.new_state {
+                                            let _ = self.handle_state_update(new_state).await;
+                                        } else {
+                                            let _ = self.remove_entity_by_id(&change.entity_id).await;
+                                        }
                                     }
                                 } else {
                                     let _ = self.handle_generic_event(&ev.event_type, &ev.data).await;

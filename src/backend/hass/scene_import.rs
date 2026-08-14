@@ -12,6 +12,7 @@ use super::client::HassState;
 pub(super) struct ImportedScene {
     pub entity_id: String,
     pub name: String,
+    pub state: String,
     pub available: bool,
     pub area_name: Option<String>,
     pub targets: Vec<String>,
@@ -56,7 +57,8 @@ pub(super) fn parse(state: &HassState, area_name: Option<String>) -> Option<Impo
     Some(ImportedScene {
         entity_id: state.entity_id.clone(),
         name,
-        available: !matches!(state.state.as_str(), "unavailable" | "unknown"),
+        state: state.state.clone(),
+        available: state.state != "unavailable",
         area_name,
         targets: target_ids(&state.attributes),
     })
@@ -67,11 +69,16 @@ pub(super) fn link(backend_name: &str, entity_id: &str) -> ResourceLink {
 }
 
 pub(super) fn is_imported(scene: &Scene) -> bool {
+    imported_entity_id(scene).is_some()
+}
+
+pub(super) fn imported_entity_id(scene: &Scene) -> Option<&str> {
     scene
         .metadata
         .appdata
         .as_deref()
-        .is_some_and(|appdata| appdata.starts_with("hass:scene:"))
+        .and_then(|appdata| appdata.strip_prefix("hass:scene:"))
+        .filter(|entity_id| !entity_id.trim().is_empty())
 }
 
 fn value_to_f64(value: &Value) -> Option<f64> {
@@ -219,5 +226,23 @@ mod tests {
         assert_eq!(link("ha", "scene.movie").rtype, RType::Scene);
         assert_eq!(scene.group, group);
         assert_eq!(scene.actions.len(), 1);
+        assert_eq!(super::imported_entity_id(&scene), Some("scene.movie"));
+    }
+
+    #[test]
+    fn unknown_scene_state_remains_recallable() {
+        let scene = parse(
+            &HassState {
+                entity_id: "scene.sleep".to_string(),
+                state: "unknown".to_string(),
+                attributes: json!({"friendly_name": "Sleep"})
+                    .as_object()
+                    .cloned()
+                    .expect("object"),
+            },
+            None,
+        )
+        .expect("scene");
+        assert!(scene.available);
     }
 }

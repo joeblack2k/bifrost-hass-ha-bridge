@@ -4,11 +4,10 @@ use serde_json::Value;
 pub(super) enum HassEventKind {
     StateChanged,
     InitialPress,
-    Press,
-    DoublePress,
-    TriplePress,
-    Hold,
-    Release,
+    ShortRelease,
+    LongPress,
+    LongRelease,
+    DoubleShortRelease,
     Repeat,
     Unknown,
 }
@@ -18,11 +17,10 @@ impl HassEventKind {
         match self {
             Self::StateChanged | Self::Unknown => None,
             Self::InitialPress => Some("initial_press"),
-            Self::Press => Some("press"),
-            Self::DoublePress => Some("double_press"),
-            Self::TriplePress => Some("triple_press"),
-            Self::Hold => Some("hold"),
-            Self::Release => Some("release"),
+            Self::ShortRelease => Some("short_release"),
+            Self::LongPress => Some("long_press"),
+            Self::LongRelease => Some("long_release"),
+            Self::DoubleShortRelease => Some("double_short_release"),
             Self::Repeat => Some("repeat"),
         }
     }
@@ -37,22 +35,16 @@ fn normalized(value: &str) -> String {
 
 fn classify_value(value: &str) -> HassEventKind {
     let value = normalized(value);
-    if value.contains("double") {
-        HassEventKind::DoublePress
-    } else if value.contains("triple") {
-        HassEventKind::TriplePress
-    } else if value.contains("initial_press") || value == "initial" {
-        HassEventKind::InitialPress
-    } else if value.contains("repeat") {
-        HassEventKind::Repeat
-    } else if value.contains("release") || value.contains("released") {
-        HassEventKind::Release
-    } else if value.contains("hold") || value.contains("long") {
-        HassEventKind::Hold
-    } else if value.contains("press") || value.contains("click") || value == "single" {
-        HassEventKind::Press
-    } else {
-        HassEventKind::Unknown
+    match value.as_str() {
+        "initial_press" | "initial" => HassEventKind::InitialPress,
+        "repeat" => HassEventKind::Repeat,
+        "short_release" | "button_short_press" | "remote_button_short_press" => {
+            HassEventKind::ShortRelease
+        }
+        "long_press" | "button_long_press" | "remote_button_long_press" => HassEventKind::LongPress,
+        "long_release" => HassEventKind::LongRelease,
+        "double_short_release" | "double_press" => HassEventKind::DoubleShortRelease,
+        _ => HassEventKind::Unknown,
     }
 }
 
@@ -93,15 +85,13 @@ pub(super) fn event_name(data: &Value) -> Option<String> {
     .map(ToOwned::to_owned)
 }
 
-pub(super) fn normalize_event_value(value: &str) -> String {
-    let kind = classify_value(value);
-    let normalized = normalized(value);
-    kind.name().unwrap_or(&normalized).to_string()
+pub(super) fn normalize_event_value(value: &str) -> Option<String> {
+    classify_value(value).name().map(ToOwned::to_owned)
 }
 
 pub(super) fn normalized_event_name(data: &Value) -> Option<String> {
     let raw = event_name(data)?;
-    Some(normalize_event_value(&raw))
+    normalize_event_value(&raw)
 }
 
 pub(super) fn normalize_event_values(value: &Value) -> Option<Value> {
@@ -113,14 +103,15 @@ pub(super) fn normalize_event_values(value: &Value) -> Option<Value> {
 
     let mut normalized_values = Vec::new();
     for value in values {
-        let normalized = normalize_event_value(value);
-        if !normalized.is_empty() && !normalized_values.contains(&normalized) {
+        let Some(normalized) = normalize_event_value(value) else {
+            continue;
+        };
+        if !normalized_values.contains(&normalized) {
             normalized_values.push(normalized);
         }
     }
-    Some(Value::Array(
-        normalized_values.into_iter().map(Value::String).collect(),
-    ))
+    (!normalized_values.is_empty())
+        .then(|| Value::Array(normalized_values.into_iter().map(Value::String).collect()))
 }
 
 pub(super) fn entity_id(data: &Value) -> Option<&str> {
@@ -143,15 +134,15 @@ mod tests {
     fn classifies_common_accessory_events() {
         assert_eq!(
             classify("zha_event", &json!({"command": "button_short_press"})),
-            HassEventKind::Press
+            HassEventKind::ShortRelease
         );
         assert_eq!(
             classify("deconz_event", &json!({"event_type": "double_press"})),
-            HassEventKind::DoublePress
+            HassEventKind::DoubleShortRelease
         );
         assert_eq!(
             classify("mqtt_event", &json!({"action": "long_release"})),
-            HassEventKind::Release
+            HassEventKind::LongRelease
         );
     }
 
@@ -169,10 +160,32 @@ mod tests {
             "event_type": "short_release",
             "event_types": ["initial_press", "repeat", "short_release", "long_press", "long_release"]
         });
-        assert_eq!(normalized_event_name(&data).as_deref(), Some("release"));
+        assert_eq!(
+            normalized_event_name(&data).as_deref(),
+            Some("short_release")
+        );
         assert_eq!(
             normalize_event_values(data.get("event_types").expect("event types")),
-            Some(json!(["initial_press", "repeat", "release", "hold"]))
+            Some(json!([
+                "initial_press",
+                "repeat",
+                "short_release",
+                "long_press",
+                "long_release"
+            ]))
+        );
+    }
+
+    #[test]
+    fn drops_unknown_event_values_instead_of_inventing_taxonomy() {
+        let data = json!({
+            "event_type": "unknown_event",
+            "event_types": ["short_release", "swipe", "long_release"]
+        });
+        assert_eq!(normalized_event_name(&data), None);
+        assert_eq!(
+            normalize_event_values(data.get("event_types").expect("event types")),
+            Some(json!(["short_release", "long_release"]))
         );
     }
 }

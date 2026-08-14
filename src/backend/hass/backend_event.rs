@@ -18,6 +18,29 @@ use crate::model::hass::{HassSwitchMode, HassUiConfig};
 
 use super::{events, light_projection, scene_import};
 
+fn light_service_calls(
+    requested_off: bool,
+    requested_on: bool,
+    data: Map<String, Value>,
+) -> Vec<(&'static str, Map<String, Value>)> {
+    if requested_off {
+        let mut calls = vec![("turn_off", Map::new())];
+        if !data.is_empty() {
+            calls.push(("turn_on", data));
+            // Home Assistant's turn_on service also powers on a light when it only carries
+            // brightness, effect or identify data. Restore Hue's requested final off state.
+            calls.push(("turn_off", Map::new()));
+        }
+        return calls;
+    }
+
+    if requested_on || !data.is_empty() {
+        vec![("turn_on", data)]
+    } else {
+        Vec::new()
+    }
+}
+
 impl HassBackend {
     fn room_id_for_link(&self, link: &ResourceLink) -> Option<String> {
         self.room_map
@@ -61,25 +84,6 @@ impl HassBackend {
     ) -> ApiResult<()> {
         match binding.kind {
             HassEntityKind::Light => {
-                if let Some(on) = upd.on {
-                    if !on.on {
-                        self.client
-                            .call_service("light", "turn_off", &binding.entity_id, Map::new())
-                            .await?;
-                        let has_follow_up = upd.identify.is_some()
-                            || upd.dimming.is_some()
-                            || upd.color.is_some()
-                            || upd.color_temperature.is_some()
-                            || upd.gradient.is_some()
-                            || upd.effects.is_some()
-                            || upd.effects_v2.is_some()
-                            || upd.timed_effects.is_some();
-                        if !has_follow_up {
-                            return Ok(());
-                        }
-                    }
-                }
-
                 let mut data = Map::new();
 
                 if binding.capabilities.supports_brightness {
@@ -116,9 +120,13 @@ impl HassBackend {
 
                 light_projection::append_update_data(&mut data, upd, &binding.capabilities);
 
-                if upd.on.is_some_and(|on| on.on) || !data.is_empty() {
+                let requested_off = upd.on.is_some_and(|on| !on.on);
+                let requested_on = upd.on.is_some_and(|on| on.on);
+                for (service, service_data) in
+                    light_service_calls(requested_off, requested_on, data)
+                {
                     self.client
-                        .call_service("light", "turn_on", &binding.entity_id, data)
+                        .call_service("light", service, &binding.entity_id, service_data)
                         .await?;
                 }
             }
@@ -354,6 +362,11 @@ impl HassBackend {
         let imported = self.imported_scene_map.remove(&link.rid).is_some()
             || scene.as_ref().is_some_and(scene_import::is_imported);
         if imported {
+            if let Some(entity_id) = scene.as_ref().and_then(scene_import::imported_entity_id) {
+                let mut ui = self.ui_state.lock().await;
+                ui.set_entity_visibility(entity_id, true);
+                ui.persist_and_log(&format!("Hidden imported Home Assistant scene {entity_id}"))?;
+            }
             self.scene_map.remove(&link.rid);
             let mut lock = self.state.lock().await;
             return lock.delete(link);
@@ -441,6 +454,26 @@ impl HassBackend {
             }
         }
 
+        let imported_scene_entities = {
+            let lock = self.state.lock().await;
+            scene_links
+                .iter()
+                .filter(|scene_link| imported_scene_rids.contains(&scene_link.rid))
+                .filter_map(|scene_link| {
+                    lock.get::<Scene>(scene_link)
+                        .ok()
+                        .and_then(scene_import::imported_entity_id)
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+        if !imported_scene_entities.is_empty() {
+            let mut ui = self.ui_state.lock().await;
+            for entity_id in imported_scene_entities {
+                ui.set_entity_visibility(&entity_id, true);
+                ui.persist_and_log(&format!("Hidden imported Home Assistant scene {entity_id}"))?;
+            }
+        }
         {
             let mut lock = self.state.lock().await;
             for scene_link in &scene_links {
@@ -482,6 +515,18 @@ impl HassBackend {
     async fn backend_scene_recall(&self, link: &ResourceLink) -> ApiResult<()> {
         if let Some(ha_scene) = self.scene_map.get(&link.rid) {
             self.client.turn_on_scene(ha_scene).await?;
+            return Ok(());
+        }
+
+        let persisted_ha_scene = {
+            let lock = self.state.lock().await;
+            lock.get::<Scene>(link)
+                .ok()
+                .and_then(scene_import::imported_entity_id)
+                .map(ToOwned::to_owned)
+        };
+        if let Some(ha_scene) = persisted_ha_scene {
+            self.client.turn_on_scene(&ha_scene).await?;
             return Ok(());
         }
 
@@ -643,5 +688,42 @@ impl HassBackend {
                 .await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::light_service_calls;
+    use serde_json::json;
+
+    #[test]
+    fn combined_off_update_restores_final_off_state() {
+        let calls = light_service_calls(
+            true,
+            false,
+            [
+                ("brightness".to_string(), json!(128)),
+                ("flash".to_string(), json!("short")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].0, "turn_off");
+        assert_eq!(calls[1].0, "turn_on");
+        assert_eq!(calls[2].0, "turn_off");
+        assert_eq!(calls[1].1.get("brightness"), Some(&json!(128)));
+    }
+
+    #[test]
+    fn plain_off_does_not_emit_a_follow_up_turn_on() {
+        let calls = light_service_calls(true, false, Default::default());
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(service, _)| *service)
+                .collect::<Vec<_>>(),
+            ["turn_off"]
+        );
     }
 }

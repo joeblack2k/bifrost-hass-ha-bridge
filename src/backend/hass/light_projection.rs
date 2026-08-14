@@ -28,18 +28,20 @@ pub(super) fn parse_effect(value: &str) -> Option<LightEffect> {
     }
 }
 
-pub(super) fn supported_effects(attributes: &Map<String, Value>) -> Vec<LightEffect> {
+pub(super) fn supported_effect_names(
+    attributes: &Map<String, Value>,
+) -> Vec<(LightEffect, String)> {
     let mut effects = Vec::new();
     let Some(values) = attributes.get("effect_list").and_then(Value::as_array) else {
         return effects;
     };
-    for effect in values
+    for (effect, name) in values
         .iter()
         .filter_map(Value::as_str)
-        .filter_map(parse_effect)
+        .filter_map(|name| parse_effect(name).map(|effect| (effect, name.to_string())))
     {
-        if !effects.contains(&effect) {
-            effects.push(effect);
+        if !effects.iter().any(|(known, _)| *known == effect) {
+            effects.push((effect, name));
         }
     }
     effects
@@ -53,11 +55,7 @@ pub(super) fn gradient_from_attributes(attributes: &Map<String, Value>) -> Optio
 }
 
 pub(super) fn supports_gradient(attributes: &Map<String, Value>) -> bool {
-    attributes.get("gradient").is_some_and(Value::is_object)
-        || attributes
-            .get("gradient_points_capable")
-            .and_then(Value::as_u64)
-            .is_some_and(|points| points > 0)
+    gradient_from_attributes(attributes).is_some()
 }
 
 fn effect_name(effect: LightEffect) -> &'static str {
@@ -113,18 +111,24 @@ pub(super) fn append_update_data(
     if capabilities.supports_effects {
         if let Some(effect) = update.effects.as_ref().and_then(effect_from_v1) {
             if capabilities.effect_values.contains(&effect) {
-                data.insert(
-                    "effect".to_string(),
-                    Value::String(effect_name(effect).to_string()),
-                );
+                let name = capabilities
+                    .effect_names
+                    .iter()
+                    .find(|(known, _)| *known == effect)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| effect_name(effect).to_string());
+                data.insert("effect".to_string(), Value::String(name));
             }
         }
         if let Some(effect) = update.effects_v2.as_ref().and_then(effect_from_v2) {
             if capabilities.effect_values.contains(&effect) {
-                data.insert(
-                    "effect".to_string(),
-                    Value::String(effect_name(effect).to_string()),
-                );
+                let name = capabilities
+                    .effect_names
+                    .iter()
+                    .find(|(known, _)| *known == effect)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| effect_name(effect).to_string());
+                data.insert("effect".to_string(), Value::String(name));
             }
         }
     }
@@ -140,7 +144,7 @@ pub(super) fn append_update_data(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_update_data, parse_effect, supported_effects};
+    use super::{append_update_data, parse_effect, supported_effect_names, supports_gradient};
     use crate::backend::hass::HassLightCapabilities;
     use hue::api::{DeviceIdentify, DeviceIdentifyUpdate, LightEffect, LightEffectsUpdate};
     use serde_json::{Map, Value, json};
@@ -157,8 +161,11 @@ mod tests {
         let mut attributes = Map::new();
         attributes.insert("effect_list".to_string(), json!(["prism", "none"]));
         assert_eq!(
-            supported_effects(&attributes),
-            vec![LightEffect::Prism, LightEffect::NoEffect]
+            supported_effect_names(&attributes),
+            vec![
+                (LightEffect::Prism, "prism".to_string()),
+                (LightEffect::NoEffect, "none".to_string())
+            ]
         );
 
         let mut data = Map::new();
@@ -178,13 +185,38 @@ mod tests {
             &HassLightCapabilities {
                 supports_effects: true,
                 effect_values: vec![LightEffect::Prism, LightEffect::NoEffect],
+                effect_names: vec![(LightEffect::Prism, "Prism".to_string())],
                 ..Default::default()
             },
         );
         assert_eq!(data.get("flash"), Some(&Value::String("short".to_string())));
         assert_eq!(
             data.get("effect"),
-            Some(&Value::String("prism".to_string()))
+            Some(&Value::String("Prism".to_string()))
         );
+    }
+
+    #[test]
+    fn only_structured_gradients_are_advertised() {
+        assert!(!supports_gradient(
+            &json!({"gradient_points_capable": 5})
+                .as_object()
+                .cloned()
+                .expect("attributes")
+        ));
+        assert!(supports_gradient(
+            &json!({
+                "gradient": {
+                    "mode": "interpolated_palette",
+                    "mode_values": ["interpolated_palette"],
+                    "points_capable": 3,
+                    "points": [{"color": {"xy": {"x": 0.3, "y": 0.3}}}],
+                    "pixel_count": 3
+                }
+            })
+            .as_object()
+            .cloned()
+            .expect("attributes")
+        ));
     }
 }

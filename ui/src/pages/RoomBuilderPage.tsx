@@ -7,7 +7,7 @@ import { Icon } from '../components/Icon'
 import { RoomCard } from '../components/RoomCard'
 import { StatusBadge } from '../components/StatusBadge'
 
-type DomainFilter = 'all' | 'light' | 'switch' | 'binary_sensor'
+type DomainFilter = 'all' | 'light' | 'switch' | 'binary_sensor' | 'scene'
 
 export function RoomBuilderPage(props: {
   config: HassUiConfig
@@ -74,7 +74,7 @@ export function RoomBuilderPage(props: {
       <section className="builder-toolbar">
         <label className="search-field"><Icon name="search" size={17} /><span className="sr-only">Search entities</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search lights, switches, sensors…" /></label>
         <div className="filter-pills" role="group" aria-label="Entity type filter">
-          {([['all', 'All'], ['light', 'Lights'], ['switch', 'Switches'], ['binary_sensor', 'Sensors']] as const).map(([value, label]) => <button key={value} className={domain === value ? 'filter-pill filter-pill-active' : 'filter-pill'} type="button" onClick={() => setDomain(value)}>{label}</button>)}
+          {([['all', 'All'], ['light', 'Lights'], ['switch', 'Switches'], ['binary_sensor', 'Sensors'], ['scene', 'Scenes']] as const).map(([value, label]) => <button key={value} className={domain === value ? 'filter-pill filter-pill-active' : 'filter-pill'} type="button" onClick={() => setDomain(value)}>{label}</button>)}
         </div>
         <label className="builder-view-select"><span className="sr-only">Library view</span><select value={libraryMode} onChange={(event) => setLibraryMode(event.target.value as 'unassigned' | 'all')}><option value="unassigned">Not in Hue</option><option value="all">All entities</option></select><Icon name="chevron-down" size={14} /></label>
         <form className="add-room-form" onSubmit={createRoom}><label className="sr-only" htmlFor="new-room-name">New room name</label><input id="new-room-name" value={newRoom} onChange={(event) => setNewRoom(event.target.value)} placeholder="New room name" /><button className="button button-secondary button-small" type="submit" disabled={!newRoom.trim()}><Icon name="plus" size={15} /> Add room</button></form>

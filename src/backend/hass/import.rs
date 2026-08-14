@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use maplit::btreeset;
 use serde_json::{Value, json};
 
@@ -51,6 +51,7 @@ struct ImportedEntity {
     gradient: Option<LightGradient>,
     event_name: Option<String>,
     event_values: Option<Value>,
+    event_time: Option<DateTime<Utc>>,
     effect: Option<hue::api::LightEffect>,
 }
 
@@ -145,7 +146,11 @@ fn parse_light_capabilities(state: &HassState) -> HassLightCapabilities {
         .any(|m| matches!(m.as_str(), "xy" | "hs" | "rgb" | "rgbw" | "rgbww"));
     let supports_color_temp =
         modes.contains("color_temp") || has_color_temp_attr || has_color_temp_kelvin_attr;
-    let effect_values = light_projection::supported_effects(&state.attributes);
+    let effect_names = light_projection::supported_effect_names(&state.attributes);
+    let effect_values = effect_names
+        .iter()
+        .map(|(effect, _)| *effect)
+        .collect::<Vec<_>>();
     let supports_brightness = has_brightness_attr
         || modes.iter().any(|m| {
             matches!(
@@ -161,6 +166,7 @@ fn parse_light_capabilities(state: &HassState) -> HassLightCapabilities {
         supports_effects: !effect_values.is_empty(),
         supports_gradient: light_projection::supports_gradient(&state.attributes),
         effect_values,
+        effect_names,
     }
 }
 
@@ -273,16 +279,16 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
                 .attributes
                 .get("event_type")
                 .and_then(Value::as_str)
-                .map(events::normalize_event_value)
+                .and_then(events::normalize_event_value)
                 .or_else(|| {
                     let state_value = state.state.trim();
                     if state_value.is_empty()
                         || matches!(state_value, "unknown" | "unavailable")
-                        || chrono::DateTime::parse_from_rfc3339(state_value).is_ok()
+                        || DateTime::parse_from_rfc3339(state_value).is_ok()
                     {
                         None
                     } else {
-                        Some(events::normalize_event_value(state_value))
+                        events::normalize_event_value(state_value)
                     }
                 })
         })
@@ -296,6 +302,10 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
                 .and_then(events::normalize_event_values)
         })
         .flatten();
+
+    if matches!(kind, HassEntityKind::Event) && event_values.is_none() {
+        return None;
+    }
 
     Some(ImportedEntity {
         entity_id: state.entity_id.clone(),
@@ -326,6 +336,10 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
             .flatten(),
         event_name,
         event_values,
+        event_time: matches!(kind, HassEntityKind::Event)
+            .then(|| DateTime::parse_from_rfc3339(state.state.trim()).ok())
+            .flatten()
+            .map(|value| value.with_timezone(&Utc)),
         effect: matches!(kind, HassEntityKind::Light)
             .then(|| {
                 state
@@ -566,20 +580,23 @@ fn make_button_resource(imported: &ImportedEntity, device_link: ResourceLink) ->
         owner: device_link,
         metadata: ButtonMetadata { control_id: 0 },
         button: ButtonData {
-            button_report: event.clone().map(|event| ButtonReport {
-                updated: Utc::now(),
-                event,
-            }),
-            last_event: event.map(Value::String),
+            button_report: imported
+                .event_time
+                .zip(event.clone())
+                .map(|(updated, event)| ButtonReport { updated, event }),
+            last_event: imported
+                .event_time
+                .is_some()
+                .then(|| event.map(Value::String))
+                .flatten(),
             repeat_interval: Some(100),
             event_values: imported.event_values.clone().or_else(|| {
                 Some(json!([
                     "initial_press",
-                    "press",
-                    "double_press",
-                    "triple_press",
-                    "hold",
-                    "release",
+                    "short_release",
+                    "long_press",
+                    "long_release",
+                    "double_short_release",
                     "repeat"
                 ]))
             }),
@@ -1325,6 +1342,34 @@ impl HassBackend {
             });
         }
 
+        for imported in &parsed_scenes {
+            let hidden = ui_config.is_manually_hidden(&imported.entity_id);
+            let included =
+                ui_config.should_include(&imported.entity_id, &imported.name, imported.available);
+            let room_id = Self::assigned_scene_room_id(&ui_config, imported, &area_map);
+            summaries.push(HassEntitySummary {
+                entity_id: imported.entity_id.clone(),
+                domain: "scene".to_string(),
+                name: imported.name.clone(),
+                state: imported.state.clone(),
+                available: imported.available,
+                included,
+                hidden,
+                area_name: imported.area_name.clone(),
+                room_id: room_id.clone(),
+                room_name: ui_config.room_name(&room_id),
+                mapped_type: "scene".to_string(),
+                supports_brightness: false,
+                supports_color: false,
+                supports_color_temp: false,
+                switch_mode: None,
+                sensor_kind: None,
+                light_archetype: None,
+                enabled: true,
+            });
+        }
+        summaries.sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
+
         {
             let mut ui_state = self.ui_state.lock().await;
             ui_state.entities = summaries;
@@ -1761,11 +1806,49 @@ mod tests {
         let imported = parse_imported_entity(&state, None).expect("event entity");
 
         assert_eq!(imported.kind, HassEntityKind::Event);
-        assert_eq!(imported.event_name.as_deref(), Some("release"));
+        assert_eq!(imported.event_name.as_deref(), Some("short_release"));
         assert_eq!(
             imported.event_values,
-            Some(json!(["initial_press", "repeat", "release", "hold"]))
+            Some(json!([
+                "initial_press",
+                "repeat",
+                "short_release",
+                "long_press",
+                "long_release"
+            ]))
         );
+        assert!(imported.event_time.is_some());
+    }
+
+    #[test]
+    fn ignores_non_accessory_event_entities_and_unstamped_reports() {
+        let unsupported = HassState {
+            entity_id: "event.system_backup".to_string(),
+            state: "unknown".to_string(),
+            attributes: json!({
+                "friendly_name": "Backup",
+                "event_types": ["completed", "failed"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        };
+        assert!(parse_imported_entity(&unsupported, None).is_none());
+
+        let unstamped = HassState {
+            entity_id: "event.dimmer_button".to_string(),
+            state: "unknown".to_string(),
+            attributes: json!({
+                "friendly_name": "Dimmer button",
+                "event_type": "short_release",
+                "event_types": ["short_release"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object"),
+        };
+        let imported = parse_imported_entity(&unstamped, None).expect("event entity");
+        assert!(imported.event_time.is_none());
     }
 
     #[test]

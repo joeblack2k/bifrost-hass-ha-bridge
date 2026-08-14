@@ -168,6 +168,7 @@ export function removeRoom(config: HassUiConfig, roomId: string) {
 
 export function domainLabel(domain: string) {
   if (domain === 'binary_sensor') return 'Sensor'
+  if (domain === 'scene') return 'Scene'
   if (domain === 'switch') return 'Switch'
   if (domain === 'light') return 'Light'
   return domain.replaceAll('_', ' ')

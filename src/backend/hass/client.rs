@@ -55,14 +55,23 @@ pub struct HassEvent {
     pub data: Value,
 }
 
+#[derive(Clone, Debug)]
+pub struct HassStateChanged {
+    pub entity_id: String,
+    pub new_state: Option<HassState>,
+}
+
 impl HassEvent {
-    pub fn state_changed(&self) -> Option<HassState> {
+    pub fn state_changed(&self) -> Option<HassStateChanged> {
         if self.event_type != "state_changed" {
             return None;
         }
         let data = serde_json::from_value::<HassStateChangedData>(self.data.clone()).ok()?;
-        let _ = (data.entity_id, data.old_state);
-        data.new_state
+        let _ = data.old_state;
+        Some(HassStateChanged {
+            entity_id: data.entity_id,
+            new_state: data.new_state,
+        })
     }
 }
 
@@ -355,7 +364,8 @@ impl HassClient {
         let url = self.endpoint_url("/api/states")?;
         let response = self.http.get(url).bearer_auth(self.token()?).send().await?;
         let response = self.check_status(response, "GET /api/states").await?;
-        Ok(response.json().await?)
+        let value = response.json::<Value>().await?;
+        parse_states(value, &self.backend_name)
     }
 
     pub async fn get_core_config(&self) -> ApiResult<HassCoreConfig> {
@@ -553,28 +563,15 @@ impl HassClient {
             }
         }
 
-        // Keep state synchronization strict, while accessory event subscriptions are optional.
-        // Each optional bus has its own short timeout; events received during the handshake are
-        // queued instead of being lost before the realtime loop starts.
+        // Keep state synchronization strict. Home Assistant event entities surface button
+        // updates through state_changed; generic integration buses do not carry a deterministic
+        // entity-to-button mapping and must not make the bridge handshake fragile.
         let mut ws = HassWs {
             socket,
             pending: VecDeque::new(),
         };
         ws.subscribe_events(1, "state_changed", true, Duration::from_secs(5))
             .await?;
-        for (id, event_type) in [(2_u64, "zha_event"), (3, "deconz_event"), (4, "mqtt_event")] {
-            if !ws
-                .subscribe_events(id, event_type, false, Duration::from_secs(1))
-                .await?
-            {
-                log::debug!(
-                    "[{}] Optional Home Assistant event subscription unavailable: {}",
-                    self.backend_name,
-                    event_type
-                );
-            }
-        }
-
         Ok(ws)
     }
 
@@ -673,14 +670,69 @@ impl HassClient {
     }
 }
 
+fn parse_states(value: Value, backend_name: &str) -> ApiResult<Vec<HassState>> {
+    let Some(values) = value.as_array() else {
+        return Err(ApiError::service_error(format!(
+            "[{backend_name}] Home Assistant /api/states response was not an array"
+        )));
+    };
+
+    let mut states = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        match serde_json::from_value::<HassState>(value.clone()) {
+            Ok(state) => states.push(state),
+            Err(err) => log::warn!(
+                "[{backend_name}] Skipping malformed Home Assistant state at index {index}: {err}"
+            ),
+        }
+    }
+    Ok(states)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::HassWs;
+    use super::{HassEvent, HassWs, parse_states};
     use futures::{SinkExt, StreamExt};
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn full_state_sync_skips_one_malformed_entity() {
+        let states = parse_states(
+            json!([
+                {"entity_id": "light.good", "state": "on", "attributes": {}},
+                {"entity_id": 42, "state": "broken"},
+                {"entity_id": "scene.good", "state": "unknown", "attributes": {}}
+            ]),
+            "test",
+        )
+        .expect("array response should be accepted");
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| state.entity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["light.good", "scene.good"]
+        );
+    }
+
+    #[test]
+    fn state_changed_keeps_entity_id_for_deletions() {
+        let event = HassEvent {
+            event_type: "state_changed".to_string(),
+            data: json!({
+                "entity_id": "scene.deleted",
+                "old_state": {"entity_id": "scene.deleted", "state": "unknown"},
+                "new_state": null
+            }),
+        };
+        let change = event.state_changed().expect("state change");
+        assert_eq!(change.entity_id, "scene.deleted");
+        assert!(change.new_state.is_none());
+    }
 
     #[test]
     fn optional_subscription_timeout_preserves_interleaved_events() {
