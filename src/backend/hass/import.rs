@@ -7,9 +7,9 @@ use serde_json::{Value, json};
 
 use hue::api::{
     ColorTemperature, Device, DeviceArchetype, DeviceProductData, Dimming, DimmingUpdate,
-    GroupedLight, Light, LightColor, LightMetadata, Metadata, MirekSchema, Motion, On, RType,
-    Resource, ResourceLink, Room, RoomArchetype, RoomMetadata, ZigbeeConnectivity,
-    ZigbeeConnectivityStatus,
+    GroupedLight, Light, LightColor, LightDynamics, LightDynamicsStatus, LightMetadata, Metadata,
+    MirekSchema, Motion, On, RType, Resource, ResourceLink, Room, RoomArchetype, RoomMetadata,
+    ZigbeeConnectivity, ZigbeeConnectivityStatus,
 };
 use hue::colortemp::kelvin_to_mirek;
 use hue::xy::XY;
@@ -406,6 +406,29 @@ fn apply_light_state(light: &mut Light, imported: &ImportedEntity) {
             light.color_temperature_delta = None;
         }
     }
+
+    // Light::new contains the complete Hue capability set. HA-backed resources must only expose
+    // controls handled by backend_light_update; this is deliberately scoped to this importer so
+    // real Zigbee/Z2M lights keep their native capabilities.
+    light.alert = None;
+    light.color_temperature_delta = None;
+    light.dimming_delta = None;
+    light.effects = None;
+    light.effects_v2 = None;
+    light.gradient = None;
+    light.service_id = None;
+    light.timed_effects = None;
+    light.powerup = None;
+    light.signaling = None;
+    light.dynamics = match imported.kind {
+        HassEntityKind::Light => Some(LightDynamics {
+            status: LightDynamicsStatus::None,
+            status_values: vec![LightDynamicsStatus::None],
+            speed: 0.0,
+            speed_valid: false,
+        }),
+        HassEntityKind::Switch | HassEntityKind::BinarySensor => None,
+    };
 }
 
 fn make_contact_resource(imported: &ImportedEntity, device_link: ResourceLink) -> Value {
@@ -1246,8 +1269,9 @@ impl HassBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_imported_entity;
+    use super::{apply_light_state, parse_imported_entity};
     use crate::backend::hass::client::HassState;
+    use hue::api::{DeviceArchetype, Light, LightMetadata, RType};
     use serde_json::json;
 
     fn light_state(attributes: serde_json::Map<String, serde_json::Value>) -> HassState {
@@ -1287,5 +1311,44 @@ mod tests {
 
         let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
         assert_eq!(imported.color_temp, Some(400));
+    }
+
+    #[test]
+    fn ha_lights_do_not_advertise_unhandled_hue_controls() {
+        let attributes = json!({
+            "friendly_name": "On off light",
+            "supported_color_modes": ["onoff"]
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        let mut light = Light::new(
+            RType::Device.deterministic("test-device"),
+            LightMetadata::new(DeviceArchetype::ClassicBulb, "On off light"),
+        );
+
+        apply_light_state(&mut light, &imported);
+
+        assert!(light.alert.is_none());
+        assert!(light.dimming.is_none());
+        assert!(light.color.is_none());
+        assert!(light.color_temperature.is_none());
+        assert!(light.color_temperature_delta.is_none());
+        assert!(light.dimming_delta.is_none());
+        assert!(light.effects.is_none());
+        assert!(light.effects_v2.is_none());
+        assert!(light.gradient.is_none());
+        assert!(light.powerup.is_none());
+        assert!(light.signaling.is_none());
+        assert!(light.timed_effects.is_none());
+        assert!(light.service_id.is_none());
+        assert_eq!(
+            light
+                .dynamics
+                .expect("transitions are the only dynamics capability")
+                .status_values,
+            vec![hue::api::LightDynamicsStatus::None]
+        );
     }
 }

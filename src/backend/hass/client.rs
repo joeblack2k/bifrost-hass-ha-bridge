@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -6,6 +6,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, connect_async};
@@ -86,18 +87,56 @@ enum HassWsIncoming {
 
 pub struct HassWs {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    pending: VecDeque<HassWsIncoming>,
 }
 
 impl HassWs {
     async fn recv_json(&mut self) -> ApiResult<Option<HassWsIncoming>> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(Some(msg));
+        }
+
         let Some(msg) = self.socket.next().await else {
             return Ok(None);
         };
         let msg = msg.map_err(ApiError::from)?;
-        let Message::Text(text) = msg else {
-            return Ok(Some(HassWsIncoming::Other));
-        };
-        Ok(Some(serde_json::from_str::<HassWsIncoming>(&text)?))
+        match msg {
+            Message::Text(text) => Ok(Some(serde_json::from_str::<HassWsIncoming>(&text)?)),
+            Message::Close(_) => Ok(None),
+            Message::Ping(payload) => {
+                self.socket.send(Message::Pong(payload)).await?;
+                Ok(Some(HassWsIncoming::Other))
+            }
+            _ => Ok(Some(HassWsIncoming::Other)),
+        }
+    }
+
+    pub async fn check_liveness(&mut self, wait: Duration) -> ApiResult<()> {
+        self.socket.send(Message::Ping(Vec::new().into())).await?;
+        let msg = timeout(wait, self.socket.next())
+            .await
+            .map_err(|_| ApiError::service_error("Home Assistant websocket liveness timeout"))?
+            .ok_or_else(|| {
+                ApiError::service_error("Home Assistant websocket closed during liveness check")
+            })?
+            .map_err(ApiError::from)?;
+
+        match msg {
+            Message::Text(text) => {
+                self.pending
+                    .push_back(serde_json::from_str::<HassWsIncoming>(&text)?);
+            }
+            Message::Close(_) => {
+                return Err(ApiError::service_error(
+                    "Home Assistant websocket closed during liveness check",
+                ));
+            }
+            Message::Ping(payload) => {
+                self.socket.send(Message::Pong(payload)).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub async fn next_state_changed(&mut self) -> ApiResult<Option<HassStateChangedEvent>> {
@@ -344,17 +383,20 @@ impl HassClient {
     pub async fn create_scene_snapshot(
         &self,
         scene_id: &str,
-        name: &str,
         snapshot_entities: Vec<String>,
     ) -> ApiResult<()> {
         let mut data = Map::new();
         data.insert("scene_id".to_string(), Value::String(scene_id.to_string()));
-        data.insert("name".to_string(), Value::String(name.to_string()));
         data.insert(
             "snapshot_entities".to_string(),
             Value::Array(snapshot_entities.into_iter().map(Value::String).collect()),
         );
         self.call_service("scene", "create", "", data).await
+    }
+
+    pub async fn delete_scene_snapshot(&self, entity_id: &str) -> ApiResult<()> {
+        self.call_service("scene", "delete", entity_id, Map::new())
+            .await
     }
 
     pub async fn turn_on_scene(&self, entity_id: &str) -> ApiResult<()> {
@@ -378,6 +420,20 @@ impl HassClient {
     }
 
     pub async fn subscribe_state_changed(&self) -> ApiResult<HassWs> {
+        timeout(
+            Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS),
+            self.subscribe_state_changed_inner(),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::service_error(format!(
+                "[{}] Home Assistant websocket handshake timed out",
+                self.backend_name
+            ))
+        })?
+    }
+
+    async fn subscribe_state_changed_inner(&self) -> ApiResult<HassWs> {
         let ws_url = self.ws_endpoint_url()?;
         let (mut socket, _response) = connect_async(ws_url.as_str()).await?;
 
@@ -448,10 +504,31 @@ impl HassClient {
             }
         }
 
-        Ok(HassWs { socket })
+        Ok(HassWs {
+            socket,
+            pending: VecDeque::new(),
+        })
     }
 
     pub async fn set_entity_registry_disabled(
+        &self,
+        entity_id: &str,
+        disabled: bool,
+    ) -> ApiResult<()> {
+        timeout(
+            Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS),
+            self.set_entity_registry_disabled_inner(entity_id, disabled),
+        )
+        .await
+        .map_err(|_| {
+            ApiError::service_error(format!(
+                "[{}] Home Assistant entity registry websocket timed out",
+                self.backend_name
+            ))
+        })?
+    }
+
+    async fn set_entity_registry_disabled_inner(
         &self,
         entity_id: &str,
         disabled: bool,
