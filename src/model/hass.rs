@@ -820,9 +820,14 @@ impl HassRuntimeState {
         }
     }
 
-    pub fn set_config_update(&mut self, update: HassRuntimeConfigUpdate) {
+    pub fn set_config_update(&mut self, update: HassRuntimeConfigUpdate) -> ApiResult<()> {
+        let url = Self::parse_url(&update.url)?;
+        let previous_url = Self::parse_url(&self.config.url).ok();
+        let origin_changed =
+            previous_url.is_none_or(|previous| !Self::same_origin(&previous, &url));
+
         self.config.enabled = update.enabled;
-        self.config.url = update.url.trim().to_string();
+        self.config.url = url.to_string();
         self.config.sync_mode = if update
             .sync_mode
             .as_ref()
@@ -836,6 +841,13 @@ impl HassRuntimeState {
                 .map(|x| x.trim().to_string())
                 .unwrap_or_else(|| "manual".to_string())
         };
+
+        // A runtime URL change must not reuse a token against another HA origin.
+        if origin_changed {
+            self.clear_token();
+        }
+
+        Ok(())
     }
 
     pub fn set_token(&mut self, token: String) -> ApiResult<()> {
@@ -859,12 +871,46 @@ impl HassRuntimeState {
     }
 
     pub fn parsed_url(&self) -> ApiResult<Url> {
-        if self.config.url.trim().is_empty() {
+        Self::parse_url(&self.config.url)
+    }
+
+    pub fn parse_url(raw: &str) -> ApiResult<Url> {
+        if raw.trim().is_empty() {
             return Err(ApiError::service_error(
                 "Home Assistant URL not set".to_string(),
             ));
         }
-        Ok(Url::parse(self.config.url.trim())?)
+
+        let url = Url::parse(raw.trim())?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ApiError::service_error(
+                "Home Assistant URL must use http or https".to_string(),
+            ));
+        }
+        if url.host_str().is_none() {
+            return Err(ApiError::service_error(
+                "Home Assistant URL must include a host".to_string(),
+            ));
+        }
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ApiError::service_error(
+                "Home Assistant URL cannot contain credentials, query parameters, or fragments"
+                    .to_string(),
+            ));
+        }
+
+        Ok(url)
+    }
+
+    #[must_use]
+    pub fn same_origin(left: &Url, right: &Url) -> bool {
+        left.scheme() == right.scheme()
+            && left.host_str() == right.host_str()
+            && left.port_or_known_default() == right.port_or_known_default()
     }
 
     #[must_use]
@@ -874,6 +920,63 @@ impl HassRuntimeState {
             .as_ref()
             .map(|x| x.trim().to_string())
             .filter(|x| !x.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod runtime_state_tests {
+    use super::{HassRuntimeConfig, HassRuntimeConfigUpdate, HassRuntimeState};
+    use camino::Utf8PathBuf;
+
+    fn state(url: &str) -> HassRuntimeState {
+        HassRuntimeState {
+            file: Utf8PathBuf::from("/dev/null"),
+            config: HassRuntimeConfig {
+                url: url.to_string(),
+                token: Some("secret".to_string()),
+                ..HassRuntimeConfig::default()
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_url_change_clears_token_only_for_a_new_origin() {
+        let mut same_origin = state("http://ha.local:8123");
+        same_origin
+            .set_config_update(HassRuntimeConfigUpdate {
+                enabled: true,
+                url: "http://ha.local:8123/".to_string(),
+                sync_mode: None,
+            })
+            .expect("same-origin URL should be accepted");
+        assert!(same_origin.config.token.is_some());
+
+        let mut new_origin = state("http://ha.local:8123");
+        new_origin
+            .set_config_update(HassRuntimeConfigUpdate {
+                enabled: true,
+                url: "https://other.local:8123".to_string(),
+                sync_mode: None,
+            })
+            .expect("new URL should be accepted");
+        assert!(new_origin.config.token.is_none());
+    }
+
+    #[test]
+    fn runtime_url_rejects_non_http_and_embedded_credentials() {
+        for url in ["file:///tmp/ha", "http://user:pass@ha.local:8123"] {
+            let mut state = state("http://ha.local:8123");
+            assert!(
+                state
+                    .set_config_update(HassRuntimeConfigUpdate {
+                        enabled: true,
+                        url: url.to_string(),
+                        sync_mode: None,
+                    })
+                    .is_err(),
+                "{url} should be rejected"
+            );
+        }
     }
 }
 

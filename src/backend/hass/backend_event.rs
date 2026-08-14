@@ -8,6 +8,7 @@ use hue::api::{
     GroupedLight, GroupedLightUpdate, LightUpdate, Motion, Resource, ResourceLink, Room, Scene,
     SceneActive, SceneStatus, SceneStatusEnum, SceneUpdate,
 };
+use hue::colortemp::mirek_to_kelvin;
 
 use crate::backend::hass::{HassBackend, HassEntityBinding, HassEntityKind, HassServiceKind};
 use crate::error::ApiResult;
@@ -60,7 +61,9 @@ impl HassBackend {
 
                 if binding.capabilities.supports_color_temp {
                     if let Some(ct) = upd.color_temperature.and_then(|ct| ct.mirek) {
-                        data.insert("color_temp".to_string(), json!(ct));
+                        if let Some(kelvin) = mirek_to_kelvin(ct) {
+                            data.insert("color_temp_kelvin".to_string(), json!(kelvin));
+                        }
                     }
                 }
 

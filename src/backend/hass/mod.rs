@@ -191,12 +191,20 @@ impl HassBackend {
         let url = if runtime_url.trim().is_empty() {
             self.server.url.clone()
         } else {
-            url::Url::parse(runtime_url.trim())?
+            HassRuntimeState::parse_url(&runtime_url)?
         };
 
         if let Some(token) = runtime_token {
             self.client.set_runtime(url, Some(token))?;
             return Ok(());
+        }
+
+        if !runtime_url.trim().is_empty() && !HassRuntimeState::same_origin(&url, &self.server.url)
+        {
+            return Err(ApiError::service_error(format!(
+                "[{}] Runtime Home Assistant URL changed origin; configure a new token",
+                self.name
+            )));
         }
 
         self.client.set_base_url(url);
@@ -287,7 +295,9 @@ impl HassBackend {
                     }
                     req = chan.recv() => {
                         let req = req?;
-                        self.handle_backend_event(req).await?;
+                        if let Err(err) = self.handle_backend_event(req).await {
+                            log::error!("[{}] backend event failed: {}", self.name, err);
+                        }
                     }
                     ev = ws.next_state_changed() => {
                         match ev {
@@ -318,7 +328,9 @@ impl HassBackend {
                     }
                     req = chan.recv() => {
                         let req = req?;
-                        self.handle_backend_event(req).await?;
+                        if let Err(err) = self.handle_backend_event(req).await {
+                            log::error!("[{}] backend event failed: {}", self.name, err);
+                        }
                     }
                 }
             }

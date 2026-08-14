@@ -11,6 +11,7 @@ use hue::api::{
     Resource, ResourceLink, Room, RoomArchetype, RoomMetadata, ZigbeeConnectivity,
     ZigbeeConnectivityStatus,
 };
+use hue::colortemp::kelvin_to_mirek;
 use hue::xy::XY;
 use uuid::Uuid;
 
@@ -122,12 +123,14 @@ fn parse_light_capabilities(state: &HassState) -> HassLightCapabilities {
     let modes = parse_supported_color_modes(state);
     let has_brightness_attr = state.attributes.contains_key("brightness");
     let has_color_temp_attr = state.attributes.contains_key("color_temp");
+    let has_color_temp_kelvin_attr = state.attributes.contains_key("color_temp_kelvin");
     let has_xy_attr = state.attributes.contains_key("xy_color");
 
     let supports_color = modes
         .iter()
         .any(|m| matches!(m.as_str(), "xy" | "hs" | "rgb" | "rgbw" | "rgbww"));
-    let supports_color_temp = modes.contains("color_temp") || has_color_temp_attr;
+    let supports_color_temp =
+        modes.contains("color_temp") || has_color_temp_attr || has_color_temp_kelvin_attr;
     let supports_brightness = has_brightness_attr
         || modes.iter().any(|m| {
             matches!(
@@ -217,9 +220,16 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
     let color_temp = if matches!(kind, HassEntityKind::Light) && capabilities.supports_color_temp {
         state
             .attributes
-            .get("color_temp")
+            .get("color_temp_kelvin")
             .and_then(value_to_u16)
-            .map(|x| x.clamp(153, 500))
+            .and_then(|x| kelvin_to_mirek(u32::from(x)))
+            .or_else(|| {
+                state
+                    .attributes
+                    .get("color_temp")
+                    .and_then(value_to_u16)
+                    .map(|x| x.clamp(153, 500))
+            })
     } else {
         None
     };
@@ -1231,5 +1241,51 @@ impl HassBackend {
         self.ui_log(format!("Removed {} from Hue bridge", entity_id))
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_imported_entity;
+    use crate::backend::hass::client::HassState;
+    use serde_json::json;
+
+    fn light_state(attributes: serde_json::Map<String, serde_json::Value>) -> HassState {
+        HassState {
+            entity_id: "light.test".to_string(),
+            state: "on".to_string(),
+            attributes,
+        }
+    }
+
+    #[test]
+    fn imports_modern_kelvin_color_temperature() {
+        let attributes = json!({
+            "friendly_name": "Test light",
+            "supported_color_modes": ["color_temp"],
+            "color_temp_kelvin": 2700
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        assert!(imported.capabilities.supports_color_temp);
+        assert_eq!(imported.color_temp, Some(370));
+    }
+
+    #[test]
+    fn keeps_legacy_mirek_color_temperature_as_fallback() {
+        let attributes = json!({
+            "friendly_name": "Test light",
+            "supported_color_modes": ["color_temp"],
+            "color_temp": 400
+        })
+        .as_object()
+        .cloned()
+        .expect("object attributes");
+
+        let imported = parse_imported_entity(&light_state(attributes), None).expect("light");
+        assert_eq!(imported.color_temp, Some(400));
     }
 }

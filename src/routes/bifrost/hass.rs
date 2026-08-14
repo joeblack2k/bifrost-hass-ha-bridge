@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -9,7 +8,6 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use bifrost_api::backend::BackendRequest;
-use hue::api::{Device, RType};
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::model::hass::{
@@ -432,76 +430,12 @@ async fn post_sync(State(state): State<AppState>) -> BifrostApiResult<Json<HassS
 }
 
 async fn post_apply(State(state): State<AppState>) -> BifrostApiResult<Json<HassApplyResponse>> {
-    let (cfg, entities) = {
-        let ui = state.hass_ui();
-        let lock = ui.lock().await;
-        (lock.config_normalized(), lock.entities.clone())
-    };
-
-    let backend_name = state
-        .config()
-        .hass
-        .servers
-        .keys()
-        .next()
-        .cloned()
-        .unwrap_or_else(|| "homeassistant".to_string());
-
-    let mut keep_device_rids = HashSet::new();
-    for ent in &entities {
-        let mut include = cfg.should_include(&ent.entity_id, &ent.name, ent.available);
-        if ent.domain == "binary_sensor" {
-            let detected = ent.sensor_kind.unwrap_or(HassSensorKind::Ignore);
-            if matches!(
-                cfg.sensor_kind(&ent.entity_id, detected),
-                HassSensorKind::Ignore
-            ) {
-                include = false;
-            }
-        }
-
-        if include {
-            let link = RType::Device
-                .deterministic(format!("hass:{}:{}:device", backend_name, ent.entity_id));
-            keep_device_rids.insert(link.rid);
-        }
-    }
-
-    let removed_devices = {
-        let mut removed = 0_usize;
-        let mut res = state.res.lock().await;
-        let device_ids = res.get_resource_ids_by_type(RType::Device);
-        for rid in device_ids {
-            if keep_device_rids.contains(&rid) {
-                continue;
-            }
-            let Ok(dev) = res.get_id::<Device>(rid) else {
-                continue;
-            };
-            if dev.product_data.manufacturer_name != "Home Assistant" {
-                continue;
-            }
-            if !dev.product_data.model_id.starts_with("hass-") {
-                continue;
-            }
-            if res.delete(&RType::Device.link_to(rid)).is_ok() {
-                removed += 1;
-            }
-        }
-        removed
-    };
-
-    {
-        let ui = state.hass_ui();
-        let mut lock = ui.lock().await;
-        lock.push_log(format!(
-            "Applied selection to Hue bridge (removed {removed_devices} devices)"
-        ));
-    }
+    let res = state.res.lock().await;
+    res.backend_request(BackendRequest::HassSync)?;
 
     Ok(Json(HassApplyResponse {
         applied: true,
-        removed_devices,
+        removed_devices: 0,
     }))
 }
 
@@ -540,7 +474,7 @@ async fn put_runtime_config(
     let config = {
         let runtime = state.hass_runtime();
         let mut lock = runtime.lock().await;
-        lock.set_config_update(update);
+        lock.set_config_update(update)?;
         lock.save()?;
         lock.public_config()
     };

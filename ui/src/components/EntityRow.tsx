@@ -53,6 +53,8 @@ export function EntityRow(props: {
   const included = !!e.included
   const [alias, setAlias] = useState(() => e.name || '')
   useEffect(() => {
+    // This is an editable draft; syncing after the background refresh preserves focus while typing.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setAlias(e.name || '')
   }, [e.name, e.entity_id])
 
