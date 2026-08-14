@@ -188,6 +188,61 @@ pub struct HassUiConfig {
     pub hass_long: Option<String>,
 }
 
+const HASS_UI_CONFIG_FIELDS: &[&str] = &[
+    "hidden_entity_ids",
+    "exclude_entity_ids",
+    "exclude_name_patterns",
+    "include_unavailable",
+    "rooms",
+    "entity_preferences",
+    "ignored_area_names",
+    "default_add_new_devices_to_hue",
+    "sync_hass_areas_to_rooms",
+    "fake_cloud_mode",
+    "fake_cloud_custom",
+    "hass_timezone",
+    "hass_lat",
+    "hass_long",
+];
+
+const REQUIRED_HASS_UI_CONFIG_FIELDS: &[&str] = &[
+    "hidden_entity_ids",
+    "exclude_entity_ids",
+    "exclude_name_patterns",
+    "include_unavailable",
+    "rooms",
+    "entity_preferences",
+    "ignored_area_names",
+    "default_add_new_devices_to_hue",
+    "sync_hass_areas_to_rooms",
+    "fake_cloud_mode",
+    "fake_cloud_custom",
+];
+
+pub(crate) fn validate_hass_ui_config_fields<'a, I>(fields: I) -> ApiResult<()>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let fields = fields.into_iter().collect::<BTreeSet<_>>();
+    if let Some(field) = fields
+        .iter()
+        .find(|field| !HASS_UI_CONFIG_FIELDS.contains(*field))
+    {
+        return Err(ApiError::service_error(format!(
+            "Bridge settings config contains unknown field: {field}"
+        )));
+    }
+    if let Some(field) = REQUIRED_HASS_UI_CONFIG_FIELDS
+        .iter()
+        .find(|field| !fields.contains(*field))
+    {
+        return Err(ApiError::service_error(format!(
+            "Bridge settings config is missing required field: {field}"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for HassUiConfig {
     fn default() -> Self {
         let mut cfg = Self {
@@ -1077,50 +1132,41 @@ struct HassUiStateFile {
     patina: HassPatinaState,
 }
 
-fn parse_ui_state_file(raw: &str) -> ApiResult<(HassUiConfig, HassPatinaState)> {
-    let mapping = serde_yml::from_str::<serde_yml::Value>(raw)
-        .ok()
-        .and_then(|value| value.as_mapping().cloned());
-    let has_v2_shape = mapping.as_ref().is_some_and(|mapping| {
-        mapping.contains_key(serde_yml::Value::from("config"))
-            || mapping.contains_key(serde_yml::Value::from("patina"))
-    });
-
-    if has_v2_shape {
-        let state = serde_yml::from_str::<HassUiStateFile>(raw)?;
-        Ok((state.config, state.patina))
-    } else {
-        let looks_like_config = mapping.as_ref().is_some_and(|mapping| {
-            mapping.keys().any(|key| {
-                key.as_str().is_some_and(|key| {
-                    matches!(
-                        key,
-                        "hidden_entity_ids"
-                            | "exclude_entity_ids"
-                            | "exclude_name_patterns"
-                            | "include_unavailable"
-                            | "rooms"
-                            | "entity_preferences"
-                            | "ignored_area_names"
-                            | "default_add_new_devices_to_hue"
-                            | "sync_hass_areas_to_rooms"
-                            | "fake_cloud_mode"
-                            | "fake_cloud_custom"
-                            | "hass_timezone"
-                            | "hass_lat"
-                            | "hass_long"
-                    )
-                })
+fn validate_yaml_config_mapping(mapping: &serde_yml::Mapping) -> ApiResult<()> {
+    let fields = mapping
+        .keys()
+        .map(|key| {
+            key.as_str().ok_or_else(|| {
+                ApiError::service_error("Bridge settings config keys must be strings")
             })
-        });
-        if !looks_like_config {
-            return Err(ApiError::service_error(
-                "Bridge settings file has no recognized configuration fields",
-            ));
-        }
-        let config = serde_yml::from_str::<HassUiConfig>(raw)?;
-        Ok((config, HassPatinaState::default()))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
+    validate_hass_ui_config_fields(fields)
+}
+
+fn parse_ui_state_file(raw: &str) -> ApiResult<(HassUiConfig, HassPatinaState)> {
+    let document = serde_yml::from_str::<serde_yml::Value>(raw)?;
+    let mapping = document
+        .as_mapping()
+        .ok_or_else(|| ApiError::service_error("Bridge settings file must be a YAML mapping"))?;
+
+    if mapping.contains_key(serde_yml::Value::from("config"))
+        || mapping.contains_key(serde_yml::Value::from("patina"))
+    {
+        let config = mapping
+            .get(serde_yml::Value::from("config"))
+            .and_then(serde_yml::Value::as_mapping)
+            .ok_or_else(|| {
+                ApiError::service_error("Bridge settings file must contain a mapping config field")
+            })?;
+        validate_yaml_config_mapping(config)?;
+        let state = serde_yml::from_str::<HassUiStateFile>(raw)?;
+        return Ok((state.config, state.patina));
     }
+
+    validate_yaml_config_mapping(mapping)?;
+    let config = serde_yml::from_str::<HassUiConfig>(raw)?;
+    Ok((config, HassPatinaState::default()))
 }
 
 impl HassUiState {
@@ -1821,6 +1867,23 @@ mod atomic_save_tests {
             .expect("backup should be corruptible");
         fs::write(&file, b"still: [not valid").expect("canonical settings should be corruptible");
         assert!(HassUiState::load(file).is_err());
+    }
+
+    #[test]
+    fn ui_parser_rejects_partial_or_unknown_config_shapes() {
+        for raw in [
+            "config: {}\n",
+            "config:\n  rooms: []\n",
+            "config:\n  unrelated: true\n",
+            "patina: {}\n",
+            "rooms: []\n",
+        ] {
+            assert!(parse_ui_state_file(raw).is_err(), "invalid settings: {raw}");
+        }
+
+        let raw = serde_yml::to_string(&HassUiConfig::default())
+            .expect("complete config should serialize");
+        assert!(parse_ui_state_file(&raw).is_ok());
     }
 
     #[test]
