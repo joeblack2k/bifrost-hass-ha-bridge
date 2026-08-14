@@ -17,6 +17,23 @@ pub struct AuxData {
     pub index: Option<u32>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LegacyResourceLink {
+    pub link_type: String,
+    pub name: String,
+    pub description: String,
+    pub classid: u32,
+    pub owner: Uuid,
+    pub recycle: bool,
+    pub links: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct LegacyState {
+    #[serde(default)]
+    pub resource_links: BTreeMap<u32, LegacyResourceLink>,
+}
+
 impl AuxData {
     #[must_use]
     pub fn new() -> Self {
@@ -107,6 +124,8 @@ pub struct State {
     aux: BTreeMap<Uuid, AuxData>,
     id_v1: IdMap,
     pub res: BTreeMap<Uuid, Resource>,
+    #[serde(default)]
+    pub legacy: LegacyState,
 }
 
 impl State {
@@ -189,6 +208,7 @@ impl State {
             aux,
             id_v1,
             res,
+            legacy: LegacyState::default(),
         })
     }
 

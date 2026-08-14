@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use bytes::Bytes;
 use chrono::Utc;
 use log::{info, warn};
@@ -22,9 +22,9 @@ use hue::api::{
 use hue::error::{HueApiV1Error, HueError, HueResult};
 use hue::legacy_api::{
     ApiGroup, ApiGroupAction, ApiGroupActionUpdate, ApiGroupClass, ApiGroupNew, ApiGroupState,
-    ApiGroupType, ApiGroupUpdate2, ApiLight, ApiLightStateUpdate, ApiResourceType, ApiScene,
-    ApiSceneAppData, ApiSceneType, ApiSceneVersion, ApiUserConfig, Capabilities, HueApiResult,
-    NewUser, NewUserReply,
+    ApiGroupType, ApiGroupUpdate2, ApiLight, ApiLightStateUpdate, ApiResourceLink, ApiResourceType,
+    ApiScene, ApiSceneAppData, ApiSceneType, ApiSceneVersion, ApiUserConfig, Capabilities,
+    HueApiResult, NewUser, NewUserReply,
 };
 
 use crate::error::{ApiError, ApiResult};
@@ -32,6 +32,7 @@ use crate::resource::Resources;
 use crate::routes::auth::{STANDARD_APPLICATION_ID, STANDARD_CLIENT_KEY};
 use crate::routes::clip::entertainment_configuration::{self, POSITIONS};
 use crate::routes::extractor::Json;
+use crate::routes::v1_resource_links;
 use crate::routes::v1_sensors;
 use crate::routes::{ApiV1Error, ApiV1Result};
 use crate::server::appstate::AppState;
@@ -231,7 +232,7 @@ async fn get_api_user(
         config: state.api_config(username.clone()).await?,
         groups: get_groups(&lock, false)?,
         lights: get_lights(&lock)?,
-        resourcelinks: HashMap::new(),
+        resourcelinks: v1_resource_links::get(&lock),
         rules: HashMap::new(),
         scenes: get_scenes(&username, &lock)?,
         schedules: HashMap::new(),
@@ -249,9 +250,8 @@ async fn get_api_user_resource(
         ApiResourceType::Lights => Ok(Json(json!(get_lights(lock)?))),
         ApiResourceType::Groups => Ok(Json(json!(get_groups(lock, false)?))),
         ApiResourceType::Scenes => Ok(Json(json!(get_scenes(&username, lock)?))),
-        ApiResourceType::Resourcelinks | ApiResourceType::Rules | ApiResourceType::Schedules => {
-            Ok(Json(json!({})))
-        }
+        ApiResourceType::Resourcelinks => Ok(Json(json!(v1_resource_links::get(lock)))),
+        ApiResourceType::Rules | ApiResourceType::Schedules => Ok(Json(json!({}))),
         ApiResourceType::Sensors => Ok(Json(json!(v1_sensors::get_sensors(lock)?))),
         ApiResourceType::Capabilities => Ok(Json(json!(Capabilities::new()))),
     }
@@ -290,6 +290,13 @@ async fn post_api_user_resource(
     Json(req): Json<Value>,
 ) -> ApiV1Result<Json<Value>> {
     // FIXME: these are copied from entertainment_configuration
+
+    if matches!(&resource, ApiResourceType::Resourcelinks) {
+        let link: ApiResourceLink = serde_json::from_value(req)?;
+        let mut lock = state.res.lock().await;
+        let id = v1_resource_links::create(&mut lock, link)?;
+        return Ok(Json(json!([{"success": {"id": id}}])));
+    }
 
     // We only know how to create entertainment groups
     let ApiResourceType::Groups = resource else {
@@ -374,6 +381,10 @@ async fn get_api_user_resource_id(
 
             json!(get_scene(&lock, username, scene)?)
         }
+        ApiResourceType::Resourcelinks => {
+            let lock = state.res.lock().await;
+            json!(v1_resource_links::get_one(&lock, id)?)
+        }
         ApiResourceType::Groups => {
             let lock = state.res.lock().await;
             let groups = get_groups(&lock, true)?;
@@ -442,9 +453,16 @@ async fn put_api_user_resource_id(
 
             Ok(Json(v1res.json()))
         }
+        ApiResourceType::Resourcelinks => {
+            let link: ApiResourceLink = serde_json::from_value(req)?;
+            let mut lock = state.res.lock().await;
+            v1_resource_links::update(&mut lock, id, link)?;
+            Ok(Json(json!([{
+                "success": {format!("/resourcelinks/{id}"): id}
+            }])))
+        }
         ApiResourceType::Config
         | ApiResourceType::Lights
-        | ApiResourceType::Resourcelinks
         | ApiResourceType::Rules
         | ApiResourceType::Scenes
         | ApiResourceType::Schedules
@@ -565,6 +583,21 @@ async fn put_api_user_resource_id_path(
     }
 }
 
+async fn delete_api_user_resource_id(
+    State(state): State<AppState>,
+    Path((_username, resource, id)): Path<(String, ApiResourceType, u32)>,
+) -> ApiV1Result<Json<Value>> {
+    if !matches!(resource, ApiResourceType::Resourcelinks) {
+        return Err(ApiV1Error::V1CreateUnsupported(resource));
+    }
+
+    let mut lock = state.res.lock().await;
+    v1_resource_links::delete(&mut lock, id)?;
+    Ok(Json(json!([{
+        "success": {format!("/resourcelinks/{id}"): id}
+    }])))
+}
+
 /// This generates a workaround necessary for iConnectHue (iPhone app)
 ///
 /// For some reason, iConnectHue has been observed to try the endpoint GET /api/newUser,
@@ -587,6 +620,7 @@ pub fn router() -> Router<AppState> {
         .route("/{user}/{rtype}", put(put_api_user_resource))
         .route("/{user}/{rtype}/{id}", get(get_api_user_resource_id))
         .route("/{user}/{rtype}/{id}", put(put_api_user_resource_id))
+        .route("/{user}/{rtype}/{id}", delete(delete_api_user_resource_id))
         .route(
             "/{user}/{rtype}/{id}/{key}",
             put(put_api_user_resource_id_path),
