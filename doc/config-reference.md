@@ -31,6 +31,9 @@ bifrost:
   # to store runtime Home Assistant URL/token settings
   hass_runtime_file: "data/hass-runtime.yaml"
 
+  # If these data paths are introduced during an upgrade, Bifrost migrates valid legacy
+  # hass-ui.yaml and hass-runtime.yaml files from beside the data directory once.
+
 # Bridge section
 #
 # Settings for hue bridge emulation

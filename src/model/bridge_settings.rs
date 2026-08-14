@@ -7,6 +7,23 @@ use crate::model::hass::HassUiConfig;
 pub const SETTINGS_KIND: &str = "bifrost-bridge-settings";
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
+const CONFIG_FIELDS: &[&str] = &[
+    "hidden_entity_ids",
+    "exclude_entity_ids",
+    "exclude_name_patterns",
+    "include_unavailable",
+    "rooms",
+    "entity_preferences",
+    "ignored_area_names",
+    "default_add_new_devices_to_hue",
+    "sync_hass_areas_to_rooms",
+    "fake_cloud_mode",
+    "fake_cloud_custom",
+    "hass_timezone",
+    "hass_lat",
+    "hass_long",
+];
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct BridgeSettingsExport {
     pub kind: String,
@@ -44,9 +61,23 @@ impl BridgeSettingsExport {
     }
 
     pub fn parse_value(value: Value) -> ApiResult<HassUiConfig> {
-        let mut config = if value.get("config").is_some() {
+        let object = value.as_object().ok_or_else(|| {
+            ApiError::service_error("Bridge settings import must be a JSON object")
+        })?;
+        let is_envelope = object.contains_key("config")
+            || object.contains_key("kind")
+            || object.contains_key("schema_version");
+        let mut config = if is_envelope {
             serde_json::from_value::<Self>(value)?.into_config()?
         } else {
+            if !object
+                .keys()
+                .any(|field| CONFIG_FIELDS.contains(&field.as_str()))
+            {
+                return Err(ApiError::service_error(
+                    "Bridge settings import does not contain a recognized configuration field",
+                ));
+            }
             serde_json::from_value::<HassUiConfig>(value)?
         };
         config.normalize();
@@ -87,6 +118,29 @@ mod tests {
                 "config": config,
             }))
             .is_err()
+        );
+    }
+
+    #[test]
+    fn import_rejects_incomplete_or_unknown_objects_instead_of_defaulting() {
+        assert!(
+            BridgeSettingsExport::parse_value(json!({
+                "kind": SETTINGS_KIND,
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+            }))
+            .is_err()
+        );
+        assert!(
+            BridgeSettingsExport::parse_value(json!({
+                "unrelated": true,
+            }))
+            .is_err()
+        );
+        assert!(
+            BridgeSettingsExport::parse_value(json!({
+                "rooms": [],
+            }))
+            .is_ok()
         );
     }
 }

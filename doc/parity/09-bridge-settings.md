@@ -15,6 +15,12 @@ Keep both files in the persistent data backup. The settings file contains room n
 visibility and UI preferences, but no Home Assistant token. Runtime credentials remain in the
 separate runtime file and are not part of the export format.
 
+For upgrades from the older root-level defaults, if `data/hass-ui.yaml` or
+`data/hass-runtime.yaml` is missing while the matching legacy file exists beside the `data/`
+directory, Bifrost validates and copies the legacy file into the persistent path on startup. The
+legacy file is kept in place as a rollback source. An invalid legacy file fails startup rather than
+creating an empty replacement.
+
 ## GUI interchange
 
 The System page provides JSON export/import using the browser's native download and file APIs:

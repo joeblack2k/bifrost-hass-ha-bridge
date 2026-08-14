@@ -8,6 +8,9 @@
 - `bifrost-hass.env.example`: env template (`HASS_TOKEN`)
 - `data/`: persistent bridge settings, runtime state and generated certificate files
 
+The native settings loader also migrates valid legacy root-level `hass-ui.yaml` and
+`hass-runtime.yaml` files into `data/` when the new files do not exist; the legacy files are kept.
+
 ## Deploy
 
 1. Place these files in `/opt/stacks/domotica/bifrost-hass`.
