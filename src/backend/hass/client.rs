@@ -42,22 +42,32 @@ pub struct HassClient {
     token: Option<String>,
 }
 
-#[derive(Clone, Debug)]
-pub struct HassStateChangedEvent {
-    pub entity_id: String,
-    pub new_state: Option<HassState>,
-    pub old_state: Option<HassState>,
-}
-
 #[derive(Debug, Deserialize)]
 struct HassWsEventEnvelope {
     #[serde(default)]
     pub event_type: String,
-    pub data: HassWsEventData,
+    pub data: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct HassEvent {
+    pub event_type: String,
+    pub data: Value,
+}
+
+impl HassEvent {
+    pub fn state_changed(&self) -> Option<HassState> {
+        if self.event_type != "state_changed" {
+            return None;
+        }
+        let data = serde_json::from_value::<HassStateChangedData>(self.data.clone()).ok()?;
+        let _ = (data.entity_id, data.old_state);
+        data.new_state
+    }
 }
 
 #[derive(Debug, Deserialize)]
-struct HassWsEventData {
+struct HassStateChangedData {
     pub entity_id: String,
     pub new_state: Option<HassState>,
     pub old_state: Option<HassState>,
@@ -139,16 +149,13 @@ impl HassWs {
         Ok(())
     }
 
-    pub async fn next_state_changed(&mut self) -> ApiResult<Option<HassStateChangedEvent>> {
+    pub async fn next_event(&mut self) -> ApiResult<Option<HassEvent>> {
         while let Some(msg) = self.recv_json().await? {
             if let HassWsIncoming::Event { event } = msg {
-                if event.event_type == "state_changed" {
-                    return Ok(Some(HassStateChangedEvent {
-                        entity_id: event.data.entity_id,
-                        new_state: event.data.new_state,
-                        old_state: event.data.old_state,
-                    }));
-                }
+                return Ok(Some(HassEvent {
+                    event_type: event.event_type,
+                    data: event.data,
+                }));
             }
         }
         Ok(None)
@@ -317,11 +324,11 @@ impl HassClient {
 
     pub async fn get_entity_areas(&self) -> ApiResult<HashMap<String, String>> {
         // Returns one line per entity in format: entity_id|area_name
-        let template = r#"
-{% for s in states if s.entity_id.startswith('light.') or s.entity_id.startswith('switch.') or s.entity_id.startswith('binary_sensor.') or s.entity_id.startswith('sensor.') %}
+        let template = r"
+{% for s in states if s.entity_id.startswith('light.') or s.entity_id.startswith('switch.') or s.entity_id.startswith('binary_sensor.') or s.entity_id.startswith('sensor.') or s.entity_id.startswith('event.') or s.entity_id.startswith('scene.') %}
 {{ s.entity_id }}|{{ area_name(s.entity_id) or '' }}
 {% endfor %}
-"#;
+";
         let url = self.endpoint_url("/api/template")?;
         let response = self
             .http
@@ -470,30 +477,46 @@ impl HassClient {
             }
         }
 
-        // Subscribe to state_changed events.
-        let sub = serde_json::json!({
-            "id": 1,
-            "type": "subscribe_events",
-            "event_type": "state_changed",
-        });
-        socket.send(Message::Text(sub.to_string().into())).await?;
+        // Keep state synchronization strict, while accessory event subscriptions are optional.
+        // HA installations differ in which event buses exist; one missing bus must not break the
+        // state stream for every light and sensor.
+        for (id, event_type, required) in [
+            (1_u64, Some("state_changed"), true),
+            (2_u64, Some("zha_event"), false),
+            (3_u64, Some("deconz_event"), false),
+            (4_u64, Some("mqtt_event"), false),
+        ] {
+            let mut sub = serde_json::json!({
+                "id": id,
+                "type": "subscribe_events",
+            });
+            if let Some(event_type) = event_type {
+                sub["event_type"] = Value::String(event_type.to_string());
+            }
+            socket.send(Message::Text(sub.to_string().into())).await?;
 
-        // Wait for subscribe result.
-        loop {
-            let Some(msg) = socket.next().await else {
-                return Err(ApiError::service_error(format!(
-                    "[{}] Home Assistant websocket closed during subscribe",
-                    self.backend_name
-                )));
-            };
-            let msg = msg.map_err(ApiError::from)?;
-            if let Message::Text(text) = msg {
-                let value: HassWsIncoming = serde_json::from_str(&text)?;
-                if let HassWsIncoming::Result { id, success, error } = value {
-                    if id == 1 && success {
-                        break;
-                    }
-                    if id == 1 && !success {
+            loop {
+                let Some(msg) = socket.next().await else {
+                    return Err(ApiError::service_error(format!(
+                        "[{}] Home Assistant websocket closed during subscribe",
+                        self.backend_name
+                    )));
+                };
+                let msg = msg.map_err(ApiError::from)?;
+                if let Message::Text(text) = msg {
+                    let value: HassWsIncoming = serde_json::from_str(&text)?;
+                    if let HassWsIncoming::Result {
+                        id: result_id,
+                        success,
+                        error,
+                    } = value
+                    {
+                        if result_id != id {
+                            continue;
+                        }
+                        if success || !required {
+                            break;
+                        }
                         return Err(ApiError::service_error(format!(
                             "[{}] Home Assistant subscribe_events failed: {}",
                             self.backend_name,

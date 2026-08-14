@@ -15,6 +15,8 @@ use crate::backend::hass::{HassBackend, HassEntityBinding, HassEntityKind, HassS
 use crate::error::ApiResult;
 use crate::model::hass::{HassSwitchMode, HassUiConfig};
 
+use super::{events, light_projection, scene_import};
+
 impl HassBackend {
     fn room_id_for_link(&self, link: &ResourceLink) -> Option<String> {
         self.room_map
@@ -63,7 +65,17 @@ impl HassBackend {
                         self.client
                             .call_service("light", "turn_off", &binding.entity_id, Map::new())
                             .await?;
-                        return Ok(());
+                        let has_follow_up = upd.identify.is_some()
+                            || upd.dimming.is_some()
+                            || upd.color.is_some()
+                            || upd.color_temperature.is_some()
+                            || upd.gradient.is_some()
+                            || upd.effects.is_some()
+                            || upd.effects_v2.is_some()
+                            || upd.timed_effects.is_some();
+                        if !has_follow_up {
+                            return Ok(());
+                        }
                     }
                 }
 
@@ -101,6 +113,8 @@ impl HassBackend {
                     );
                 }
 
+                light_projection::append_update_data(&mut data, upd, &binding.capabilities);
+
                 if upd.on.is_some_and(|on| on.on) || !data.is_empty() {
                     self.client
                         .call_service("light", "turn_on", &binding.entity_id, data)
@@ -115,7 +129,7 @@ impl HassBackend {
                         .await?;
                 }
             }
-            HassEntityKind::BinarySensor | HassEntityKind::Sensor => {}
+            HassEntityKind::BinarySensor | HassEntityKind::Sensor | HassEntityKind::Event => {}
         }
 
         Ok(())
@@ -159,7 +173,8 @@ impl HassBackend {
             HassServiceKind::Light
             | HassServiceKind::Switch
             | HassServiceKind::Temperature
-            | HassServiceKind::LightLevel => {}
+            | HassServiceKind::LightLevel
+            | HassServiceKind::Button => {}
         }
         drop(lock);
 
@@ -215,8 +230,9 @@ impl HassBackend {
                     HassEntityKind::Switch => {
                         binding.switch_mode.unwrap_or(HassSwitchMode::Plug) == HassSwitchMode::Light
                     }
-                    HassEntityKind::BinarySensor => false,
-                    HassEntityKind::Sensor => false,
+                    HassEntityKind::BinarySensor
+                    | HassEntityKind::Sensor
+                    | HassEntityKind::Event => false,
                 };
                 if grouped_as_light {
                     self.backend_light_update(&binding, &light_upd).await?;
@@ -252,8 +268,9 @@ impl HassBackend {
                             binding.switch_mode.unwrap_or(HassSwitchMode::Plug)
                                 == HassSwitchMode::Light
                         }
-                        HassEntityKind::BinarySensor => false,
-                        HassEntityKind::Sensor => false,
+                        HassEntityKind::BinarySensor
+                        | HassEntityKind::Sensor
+                        | HassEntityKind::Event => false,
                     })
                     .map(|binding| binding.entity_id)
                     .collect::<Vec<_>>()
@@ -329,10 +346,19 @@ impl HassBackend {
     }
 
     async fn backend_scene_delete(&mut self, link: &ResourceLink) -> ApiResult<()> {
-        let Some(scene) = ({
+        let scene = {
             let lock = self.state.lock().await;
             lock.get::<Scene>(link).ok().cloned()
-        }) else {
+        };
+        let imported = self.imported_scene_map.remove(&link.rid).is_some()
+            || scene.as_ref().is_some_and(scene_import::is_imported);
+        if imported {
+            self.scene_map.remove(&link.rid);
+            let mut lock = self.state.lock().await;
+            return lock.delete(link);
+        }
+
+        let Some(scene) = scene else {
             self.scene_map.remove(&link.rid);
             return Ok(());
         };
@@ -385,6 +411,9 @@ impl HassBackend {
         }
 
         for scene_link in &scene_links {
+            if self.imported_scene_map.contains_key(&scene_link.rid) {
+                continue;
+            }
             if let Err(err) = self
                 .client
                 .delete_scene_snapshot(&Self::scene_entity_id(scene_link))
@@ -404,6 +433,7 @@ impl HassBackend {
             }
         }
         for scene_link in scene_links {
+            self.imported_scene_map.remove(&scene_link.rid);
             self.scene_map.remove(&scene_link.rid);
         }
 
@@ -434,7 +464,7 @@ impl HassBackend {
         }
     }
 
-    async fn backend_scene_recall(&mut self, link: &ResourceLink) -> ApiResult<()> {
+    async fn backend_scene_recall(&self, link: &ResourceLink) -> ApiResult<()> {
         if let Some(ha_scene) = self.scene_map.get(&link.rid) {
             self.client.turn_on_scene(ha_scene).await?;
             return Ok(());
@@ -457,6 +487,7 @@ impl HassBackend {
                     dimming: action.action.dimming,
                     color: action.action.color,
                     color_temperature: action.action.color_temperature,
+                    gradient: action.action.gradient,
                     dynamics: None,
                     ..LightUpdate::default()
                 };
@@ -467,11 +498,7 @@ impl HassBackend {
         Ok(())
     }
 
-    async fn backend_scene_update(
-        &mut self,
-        link: &ResourceLink,
-        upd: &SceneUpdate,
-    ) -> ApiResult<()> {
+    async fn backend_scene_update(&self, link: &ResourceLink, upd: &SceneUpdate) -> ApiResult<()> {
         {
             let mut lock = self.state.lock().await;
             lock.update::<Scene>(&link.rid, |scene| {
@@ -479,7 +506,7 @@ impl HassBackend {
                 if let Some(recall) = &upd.recall {
                     if matches!(
                         recall.action,
-                        Some(SceneStatusEnum::Active) | Some(SceneStatusEnum::Static)
+                        Some(SceneStatusEnum::Active | SceneStatusEnum::Static)
                     ) {
                         scene.status = Some(SceneStatus {
                             active: SceneActive::Static,
@@ -493,7 +520,7 @@ impl HassBackend {
         if let Some(recall) = &upd.recall {
             if matches!(
                 recall.action,
-                Some(SceneStatusEnum::Active) | Some(SceneStatusEnum::Static)
+                Some(SceneStatusEnum::Active | SceneStatusEnum::Static)
             ) {
                 self.backend_scene_recall(link).await?;
                 return Ok(());
@@ -574,6 +601,32 @@ impl HassBackend {
             | BackendRequest::ZigbeeDeviceDiscovery(_, _) => {}
         }
 
+        Ok(())
+    }
+
+    pub(super) async fn handle_generic_event(
+        &mut self,
+        event_type: &str,
+        data: &Value,
+    ) -> ApiResult<()> {
+        let kind = events::classify(event_type, data);
+        if matches!(
+            kind,
+            events::HassEventKind::Unknown | events::HassEventKind::StateChanged
+        ) {
+            return Ok(());
+        }
+
+        if let Some(entity_id) = events::entity_id(data) {
+            if entity_id.starts_with("event.") {
+                let _ = self.sync_entity_by_id(entity_id).await;
+            }
+        }
+
+        if let Some(name) = events::event_name(data) {
+            self.ui_log(format!("Accessory event {event_type}: {name}"))
+                .await;
+        }
         Ok(())
     }
 }

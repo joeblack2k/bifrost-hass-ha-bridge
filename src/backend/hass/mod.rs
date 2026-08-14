@@ -1,7 +1,10 @@
 mod backend_event;
 mod client;
+mod events;
 mod import;
+mod light_projection;
 mod projections;
+mod scene_import;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,7 +21,7 @@ use uuid::Uuid;
 
 use bifrost_api::backend::BackendRequest;
 use bifrost_api::config::HassServer;
-use hue::api::{RType, ResourceLink};
+use hue::api::{LightEffect, RType, ResourceLink};
 
 use crate::error::{ApiError, ApiResult};
 use crate::model::hass::{HassRoomConfig, HassRuntimeState, HassSwitchMode, HassUiState};
@@ -39,6 +42,7 @@ pub(super) enum HassEntityKind {
     Switch,
     BinarySensor,
     Sensor,
+    Event,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,13 +53,17 @@ pub(super) enum HassServiceKind {
     Contact,
     Temperature,
     LightLevel,
+    Button,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct HassLightCapabilities {
     pub supports_brightness: bool,
     pub supports_color: bool,
     pub supports_color_temp: bool,
+    pub supports_effects: bool,
+    pub supports_gradient: bool,
+    pub effect_values: Vec<LightEffect>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,9 +127,11 @@ pub struct HassBackend {
     entity_map: HashMap<String, HassEntityBinding>,
     light_map: HashMap<Uuid, String>,
     sensor_map: HashMap<Uuid, String>,
+    button_map: HashMap<Uuid, String>,
     device_map: HashMap<Uuid, String>,
     room_map: HashMap<String, HassRoomBinding>,
     scene_map: HashMap<Uuid, String>,
+    imported_scene_map: HashMap<Uuid, String>,
     ws: Option<HassWs>,
     ws_backoff_secs: u64,
     ws_retry_at: Instant,
@@ -146,9 +156,11 @@ impl HassBackend {
             entity_map: HashMap::new(),
             light_map: HashMap::new(),
             sensor_map: HashMap::new(),
+            button_map: HashMap::new(),
             device_map: HashMap::new(),
             room_map: HashMap::new(),
             scene_map: HashMap::new(),
+            imported_scene_map: HashMap::new(),
             ws: None,
             ws_backoff_secs: 1,
             ws_retry_at: Instant::now(),
@@ -334,15 +346,15 @@ impl HassBackend {
                             log::error!("[{}] backend event failed: {}", self.name, err);
                         }
                     }
-                    ev = ws.next_state_changed() => {
+                    ev = ws.next_event() => {
                         match ev {
                             Ok(Some(ev)) => {
-                                // Keep fields "used" to avoid -D warnings while still being explicit
-                                // about which parts drive Hue state updates.
-                                let _entity_id = ev.entity_id;
-                                let _old_state = ev.old_state;
-                                if let Some(new_state) = ev.new_state {
-                                    let _ = self.handle_state_update(new_state).await;
+                                if ev.event_type == "state_changed" {
+                                    if let Some(new_state) = ev.state_changed() {
+                                        let _ = self.handle_state_update(new_state).await;
+                                    }
+                                } else {
+                                    let _ = self.handle_generic_event(&ev.event_type, &ev.data).await;
                                 }
                             }
                             Ok(None) => {

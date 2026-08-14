@@ -17,7 +17,10 @@ pub use behavior::{
     BehaviorInstanceUpdate, BehaviorScript, BehaviorScriptMetadata, WakeupConfiguration,
     WakeupStyle,
 };
-pub use device::{Device, DeviceArchetype, DeviceProductData, DeviceUpdate, Identify};
+pub use device::{
+    Device, DeviceArchetype, DeviceIdentify, DeviceIdentifyUpdate, DeviceProductData, DeviceUpdate,
+    Identify,
+};
 pub use entertainment::{Entertainment, EntertainmentSegment, EntertainmentSegments};
 pub use entertainment_config::{
     EntertainmentConfiguration, EntertainmentConfigurationAction,
@@ -35,9 +38,9 @@ pub use light::{
     ColorGamut, ColorTemperature, ColorTemperatureUpdate, ColorUpdate, Delta, Dimming,
     DimmingUpdate, GamutType, Light, LightAlert, LightColor, LightDynamics, LightDynamicsStatus,
     LightEffect, LightEffectActionUpdate, LightEffectParameters, LightEffectStatus,
-    LightEffectValues, LightEffects, LightEffectsV2, LightEffectsV2Update, LightFunction,
-    LightGradient, LightGradientMode, LightGradientPoint, LightGradientUpdate, LightMetadata,
-    LightMode, LightPowerup, LightPowerupColor, LightPowerupDimming, LightPowerupOn,
+    LightEffectValues, LightEffects, LightEffectsUpdate, LightEffectsV2, LightEffectsV2Update,
+    LightFunction, LightGradient, LightGradientMode, LightGradientPoint, LightGradientUpdate,
+    LightMetadata, LightMode, LightPowerup, LightPowerupColor, LightPowerupDimming, LightPowerupOn,
     LightPowerupPreset, LightProductData, LightSignal, LightSignaling, LightTimedEffect,
     LightTimedEffects, LightTimedEffectsUpdate, LightUpdate, MirekSchema, On,
 };
