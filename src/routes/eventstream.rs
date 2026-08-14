@@ -7,10 +7,33 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
+use hue::event::EventBlock;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
-use crate::error::ApiResult;
+use crate::error::{ApiError, ApiResult};
 use crate::server::appstate::AppState;
+use crate::server::hueevents::{HueEventRecord, HueEventReplay};
+
+fn event_from_block(block: EventBlock, id: Option<String>) -> Result<Event, axum::Error> {
+    let json = [block];
+    log::trace!(
+        "## EVENT ##: {}",
+        serde_json::to_string(&json).unwrap_or_else(|_| "ERROR".to_string())
+    );
+    let event = id.map_or_else(Event::default, |id| Event::default().id(id));
+    event.json_data(json)
+}
+
+fn event_from_record(record: HueEventRecord) -> Result<Event, axum::Error> {
+    let id = record.id();
+    event_from_block(record.block, Some(id))
+}
+
+#[allow(clippy::result_large_err)]
+fn api_event_from_record(record: HueEventRecord) -> ApiResult<Event> {
+    event_from_record(record).map_err(ApiError::from)
+}
 
 pub async fn get_clip_v2(
     headers: HeaderMap,
@@ -19,37 +42,45 @@ pub async fn get_clip_v2(
     let hello = tokio_stream::iter([Ok(Event::default().comment("hi"))]);
     let last_event_id = headers.get("last-event-id").map(HeaderValue::to_str);
 
-    let channel = state.res.lock().await.hue_event_stream().subscribe();
-    let stream = BroadcastStream::new(channel);
-    let events = match last_event_id {
-        Some(Ok(id)) => {
-            let previous_events = state
-                .res
-                .lock()
-                .await
-                .hue_event_stream()
-                .events_sent_after_id(id);
-            stream::iter(previous_events.into_iter().map(Ok))
-                .chain(stream)
-                .boxed()
-        }
-        _ => stream.boxed(),
+    let (channel, replay) = {
+        let lock = state.res.lock().await;
+        let channel = lock.hue_event_stream().subscribe();
+        let replay = match last_event_id {
+            Some(Ok(id)) => match lock.hue_event_stream().events_sent_after_id(id) {
+                HueEventReplay::After(events) => {
+                    events.into_iter().map(api_event_from_record).collect()
+                }
+                HueEventReplay::SnapshotRequired { checkpoint } => {
+                    vec![
+                        event_from_block(EventBlock::add(lock.get_resources()), checkpoint)
+                            .map_err(ApiError::from),
+                    ]
+                }
+            },
+            _ => Vec::new(),
+        };
+        (channel, replay)
     };
 
-    let stream = events.map(move |e| {
-        let evt = e?;
-        let evt_id = evt.id();
-        let json = [evt.block];
-        log::trace!(
-            "## EVENT ##: {}",
-            serde_json::to_string(&json).unwrap_or_else(|_| "ERROR".to_string())
-        );
-        Ok(Event::default().id(evt_id).json_data(json)?)
+    let live = BroadcastStream::new(channel).scan(false, |terminated, event| {
+        if *terminated {
+            return futures::future::ready(None);
+        }
+
+        futures::future::ready(Some(match event {
+            Ok(record) => api_event_from_record(record),
+            Err(err @ BroadcastStreamRecvError::Lagged(missed)) => {
+                *terminated = true;
+                log::warn!("Hue SSE stream lagged; missed {missed} events");
+                Err(err.into())
+            }
+        }))
     });
+    let events = stream::iter(replay).chain(live).boxed();
 
     // Hue clients (especially on mobile) rely on a long-lived SSE connection to get realtime
     // updates; without keep-alives, intermediaries/OSes can silently tear down the stream.
-    Sse::new(hello.chain(stream)).keep_alive(
+    Sse::new(hello.chain(events)).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text(": ping"),

@@ -1,11 +1,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::fs::File;
+use std::io::Write;
 
 use camino::Utf8PathBuf;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
+use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 
@@ -740,6 +742,48 @@ impl Default for HassRuntimeConfig {
     }
 }
 
+fn atomic_write(path: &Utf8PathBuf, contents: &[u8]) -> ApiResult<()> {
+    let mut temp_path = path.clone();
+    temp_path.set_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or("bifrost"),
+        Uuid::new_v4()
+    ));
+
+    let mut temp_created = false;
+    let result = (|| {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(0o600);
+        }
+
+        let mut file = options.open(&temp_path)?;
+        temp_created = true;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, path)?;
+
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+
+        Ok(())
+    })();
+
+    if temp_created && result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HassRuntimeConfigPublic {
     pub enabled: bool,
@@ -802,9 +846,8 @@ impl HassRuntimeState {
     }
 
     pub fn save(&self) -> ApiResult<()> {
-        let file = File::create(&self.file)?;
-        serde_yml::to_writer(file, &self.config)?;
-        Ok(())
+        let yaml = serde_yml::to_string(&self.config)?;
+        atomic_write(&self.file, yaml.as_bytes())
     }
 
     pub fn public_config(&self) -> HassRuntimeConfigPublic {
@@ -1075,13 +1118,12 @@ impl HassUiState {
         patina
             .interactions_by_key
             .retain(|k, _| !k.trim().is_empty());
-        let file = File::create(&self.file)?;
         let state = HassUiStateFile {
             config: cfg,
             patina,
         };
-        serde_yml::to_writer(file, &state)?;
-        Ok(())
+        let yaml = serde_yml::to_string(&state)?;
+        atomic_write(&self.file, yaml.as_bytes())
     }
 
     fn patina_days_since_install(&self) -> u64 {
@@ -1386,19 +1428,14 @@ pub struct HassSyncResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
-pub struct HassApplyResponse {
-    pub applied: bool,
-    pub removed_devices: usize,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HassResetBridgeResponse {
     pub reset: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct HassConnectResponse {
-    pub connected: bool,
+    pub queued: bool,
+    pub enabled: bool,
     pub runtime: HassRuntimeConfigPublic,
 }
 
@@ -1425,5 +1462,244 @@ impl HassUiState {
         self.save_config()?;
         self.push_log(reason);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod atomic_save_tests {
+    use super::{
+        HassEntityPreference, HassFakeCloudMode, HassPatinaState, HassRuntimeConfig,
+        HassRuntimeState, HassSyncStatus, HassUiConfig, HassUiState, HassUiStateFile,
+    };
+    use camino::Utf8PathBuf;
+    use std::collections::HashMap;
+    use std::fs;
+    use uuid::Uuid;
+
+    struct TestDir(Utf8PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("bifrost-hass-{}", Uuid::new_v4()));
+            fs::create_dir(&path).expect("test directory should be created");
+            Self(Utf8PathBuf::from_path_buf(path).expect("temporary path should be UTF-8"))
+        }
+
+        fn file(&self, name: &str) -> Utf8PathBuf {
+            self.0.join(name)
+        }
+
+        fn assert_no_temp_files(&self) {
+            let leftovers = fs::read_dir(&self.0)
+                .expect("test directory should be readable")
+                .map(|entry| {
+                    entry
+                        .expect("directory entry should be readable")
+                        .file_name()
+                })
+                .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+                .collect::<Vec<_>>();
+            assert!(
+                leftovers.is_empty(),
+                "temporary files remain: {leftovers:?}"
+            );
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_private(path: &Utf8PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = fs::metadata(path)
+            .expect("saved file should exist")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "saved file must be private");
+    }
+
+    #[test]
+    fn runtime_save_writes_complete_yaml_and_reloads_all_fields() {
+        let dir = TestDir::new();
+        let file = dir.file("runtime.yaml");
+        let config = HassRuntimeConfig {
+            enabled: false,
+            url: "https://ha.local:8123".to_string(),
+            sync_mode: "websocket".to_string(),
+            token: Some("secret".to_string()),
+        };
+        let state = HassRuntimeState {
+            file: file.clone(),
+            config: config.clone(),
+        };
+
+        state.save().expect("runtime state should save");
+
+        let yaml = fs::read_to_string(&file).expect("saved runtime YAML should be readable");
+        let parsed: HassRuntimeConfig =
+            serde_yml::from_str(&yaml).expect("runtime YAML should be complete and parseable");
+        assert_eq!(parsed, config);
+        assert_eq!(HassRuntimeState::load(file, None).unwrap().config, config);
+        dir.assert_no_temp_files();
+        #[cfg(unix)]
+        assert_private(&state.file);
+    }
+
+    #[test]
+    fn atomic_save_keeps_existing_target_when_rename_fails() {
+        let dir = TestDir::new();
+        let file = dir.file("runtime.yaml");
+        fs::create_dir(&file).expect("target directory should be created");
+        fs::write(file.join("marker"), b"old target").expect("target marker should be written");
+        let state = HassRuntimeState {
+            file: file.clone(),
+            config: HassRuntimeConfig::default(),
+        };
+
+        assert!(
+            state.save().is_err(),
+            "renaming over a directory should fail"
+        );
+        assert_eq!(
+            fs::read(file.join("marker")).expect("old target should remain"),
+            b"old target"
+        );
+        dir.assert_no_temp_files();
+    }
+
+    #[test]
+    fn ui_save_writes_normalized_yaml_and_reloads_persistent_fields() {
+        let dir = TestDir::new();
+        let file = dir.file("hass-ui.yaml");
+        let mut config = HassUiConfig::default();
+        config.hidden_entity_ids = vec![" light.kitchen ".to_string()];
+        config.include_unavailable = false;
+        config.default_add_new_devices_to_hue = true;
+        config.sync_hass_areas_to_rooms = false;
+        config.fake_cloud_mode = HassFakeCloudMode::Connected;
+        config.hass_timezone = Some(" Europe/Amsterdam ".to_string());
+        config.entity_preferences.insert(
+            "light.kitchen".to_string(),
+            HassEntityPreference {
+                alias: Some("Kitchen".to_string()),
+                ..HassEntityPreference::default()
+            },
+        );
+        let patina = HassPatinaState {
+            install_date: "2026-08-14T10:00:00Z".to_string(),
+            interaction_count: 3,
+            interactions_by_key: HashMap::from([(String::from("boot"), 2)]),
+        };
+        let state = HassUiState {
+            file: file.clone(),
+            config,
+            patina: patina.clone(),
+            entities: Vec::new(),
+            logs: Vec::new(),
+            sync: HassSyncStatus::default(),
+        };
+
+        state.save_config().expect("UI state should save");
+
+        let yaml = fs::read_to_string(&file).expect("saved UI YAML should be readable");
+        let stored: HassUiStateFile =
+            serde_yml::from_str(&yaml).expect("UI YAML should be complete and parseable");
+        assert_eq!(stored.patina, patina);
+        assert!(!stored.config.include_unavailable);
+        assert!(stored.config.default_add_new_devices_to_hue);
+        assert!(!stored.config.sync_hass_areas_to_rooms);
+        assert_eq!(stored.config.fake_cloud_mode, HassFakeCloudMode::Connected);
+        assert_eq!(
+            stored.config.hass_timezone.as_deref(),
+            Some("Europe/Amsterdam")
+        );
+        assert_eq!(stored.config.hidden_entity_ids, ["light.kitchen"]);
+        assert_eq!(
+            stored
+                .config
+                .entity_preferences
+                .get("light.kitchen")
+                .and_then(|pref| pref.alias.as_deref()),
+            Some("Kitchen")
+        );
+
+        let loaded = HassUiState::load(file).expect("UI state should reload");
+        assert_eq!(loaded.patina, patina);
+        assert_eq!(loaded.config.fake_cloud_mode, HassFakeCloudMode::Connected);
+        assert_eq!(
+            loaded.config.hass_timezone.as_deref(),
+            Some("Europe/Amsterdam")
+        );
+        dir.assert_no_temp_files();
+        #[cfg(unix)]
+        assert_private(&state.file);
+    }
+}
+
+#[cfg(test)]
+mod response_serialization_tests {
+    use super::{HassConnectResponse, HassRuntimeConfigPublic, HassSyncResponse, HassSyncStatus};
+
+    #[test]
+    fn sync_and_apply_response_serializes_as_queued_sync_only() {
+        let response = HassSyncResponse {
+            queued: true,
+            sync: HassSyncStatus {
+                last_sync_at: Some("2026-08-14T12:00:00Z".to_string()),
+                last_sync_result: Some("ok".to_string()),
+                sync_in_progress: true,
+                last_sync_duration_ms: Some(42),
+            },
+        };
+
+        let value = serde_json::to_value(response).expect("sync response should serialize");
+
+        assert_eq!(value["queued"], true);
+        assert!(value.get("sync").is_some());
+        assert!(value.get("applied").is_none());
+        assert!(value.get("removed_devices").is_none());
+    }
+
+    #[test]
+    fn connect_and_disconnect_response_serializes_as_queued_enabled_runtime() {
+        for enabled in [true, false] {
+            let response = HassConnectResponse {
+                queued: true,
+                enabled,
+                runtime: HassRuntimeConfigPublic {
+                    enabled,
+                    url: "https://ha.local:8123".to_string(),
+                    sync_mode: "manual".to_string(),
+                    token_present: true,
+                },
+            };
+
+            let value = serde_json::to_value(response).expect("connect response should serialize");
+
+            assert_eq!(value["queued"], true);
+            assert_eq!(value["enabled"], enabled);
+            assert!(value.get("runtime").is_some());
+            assert!(value.get("connected").is_none());
+        }
+    }
+
+    #[test]
+    fn runtime_public_response_contains_no_token() {
+        let response = HassRuntimeConfigPublic {
+            enabled: true,
+            url: "https://ha.local:8123".to_string(),
+            sync_mode: "manual".to_string(),
+            token_present: true,
+        };
+
+        let value = serde_json::to_value(response).expect("runtime response should serialize");
+
+        assert!(value.get("token").is_none());
+        assert!(value.get("token_present").is_some());
     }
 }

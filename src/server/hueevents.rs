@@ -20,6 +20,12 @@ impl HueEventRecord {
 }
 
 #[derive(Clone, Debug)]
+pub enum HueEventReplay {
+    After(Vec<HueEventRecord>),
+    SnapshotRequired { checkpoint: Option<String> },
+}
+
+#[derive(Clone, Debug)]
 pub struct HueEventStream {
     timestamp: DateTime<Utc>,
     index: u32,
@@ -33,7 +39,7 @@ impl HueEventStream {
         Self {
             timestamp: Utc::now(),
             index: 0,
-            hue_updates: Sender::new(32),
+            hue_updates: Sender::new(buffer_capacity),
             buffer: VecDeque::with_capacity(buffer_capacity),
         }
     }
@@ -42,7 +48,7 @@ impl HueEventStream {
         if self.buffer.len() == self.buffer.capacity() {
             self.buffer.pop_front();
             self.buffer.push_back(record);
-            debug_assert!(self.buffer.len() == self.buffer.capacity());
+            debug_assert_eq!(self.buffer.len(), self.buffer.capacity());
         } else {
             self.buffer.push_back(record);
         }
@@ -64,13 +70,18 @@ impl HueEventStream {
     }
 
     #[must_use]
-    pub fn events_sent_after_id(&self, id: &str) -> Vec<HueEventRecord> {
-        let mut events = self.buffer.iter().skip_while(|record| record.id() != id);
-        match events.next() {
-            Some(_) => events.cloned().collect(),
-            // return all events if requested event is not in buffer
-            None => self.buffer.iter().cloned().collect(),
-        }
+    pub fn events_sent_after_id(&self, id: &str) -> HueEventReplay {
+        self.buffer
+            .iter()
+            .position(|record| record.id() == id)
+            .map_or_else(
+                || HueEventReplay::SnapshotRequired {
+                    checkpoint: self.buffer.back().map(HueEventRecord::id),
+                },
+                |position| {
+                    HueEventReplay::After(self.buffer.iter().skip(position + 1).cloned().collect())
+                },
+            )
     }
 
     pub fn hue_event(&mut self, block: EventBlock) {
@@ -84,5 +95,104 @@ impl HueEventStream {
     #[must_use]
     pub fn subscribe(&self) -> Receiver<HueEventRecord> {
         self.hue_updates.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    use super::{HueEventReplay, HueEventStream};
+    use hue::event::EventBlock;
+
+    fn add_event(
+        stream: &mut HueEventStream,
+        receiver: &mut tokio::sync::broadcast::Receiver<super::HueEventRecord>,
+    ) -> String {
+        stream.hue_event(EventBlock::add(Vec::new()));
+        receiver.try_recv().expect("event should be buffered").id()
+    }
+
+    #[test]
+    fn known_id_returns_exact_suffix() {
+        let mut stream = HueEventStream::new(4);
+        let mut receiver = stream.subscribe();
+        let first = add_event(&mut stream, &mut receiver);
+        let second = add_event(&mut stream, &mut receiver);
+        let third = add_event(&mut stream, &mut receiver);
+
+        let HueEventReplay::After(events) = stream.events_sent_after_id(&first) else {
+            panic!("known id should replay a suffix");
+        };
+        assert_eq!(
+            events
+                .iter()
+                .map(super::HueEventRecord::id)
+                .collect::<Vec<_>>(),
+            [second, third]
+        );
+    }
+
+    #[test]
+    fn newest_id_returns_empty_replay() {
+        let mut stream = HueEventStream::new(2);
+        let mut receiver = stream.subscribe();
+        let newest = add_event(&mut stream, &mut receiver);
+
+        assert!(matches!(
+            stream.events_sent_after_id(&newest),
+            HueEventReplay::After(events) if events.is_empty()
+        ));
+    }
+
+    #[test]
+    fn unknown_id_requires_snapshot_at_newest_checkpoint() {
+        let mut stream = HueEventStream::new(2);
+        let mut receiver = stream.subscribe();
+        let _first = add_event(&mut stream, &mut receiver);
+        let newest = add_event(&mut stream, &mut receiver);
+
+        assert!(matches!(
+            stream.events_sent_after_id("unknown"),
+            HueEventReplay::SnapshotRequired { checkpoint: Some(checkpoint) } if checkpoint == newest
+        ));
+    }
+
+    #[test]
+    fn evicted_id_requires_snapshot_at_newest_checkpoint() {
+        let mut stream = HueEventStream::new(2);
+        let mut receiver = stream.subscribe();
+        let evicted = add_event(&mut stream, &mut receiver);
+        let _second = add_event(&mut stream, &mut receiver);
+        let newest = add_event(&mut stream, &mut receiver);
+
+        assert!(matches!(
+            stream.events_sent_after_id(&evicted),
+            HueEventReplay::SnapshotRequired { checkpoint: Some(checkpoint) } if checkpoint == newest
+        ));
+    }
+
+    #[test]
+    fn empty_buffer_has_no_snapshot_checkpoint() {
+        let stream = HueEventStream::new(2);
+
+        assert!(matches!(
+            stream.events_sent_after_id("unknown"),
+            HueEventReplay::SnapshotRequired { checkpoint: None }
+        ));
+    }
+
+    #[test]
+    fn broadcast_capacity_matches_buffer_capacity() {
+        let mut stream = HueEventStream::new(2);
+        let mut receiver = stream.subscribe();
+        for _ in 0..3 {
+            stream.hue_event(EventBlock::add(Vec::new()));
+        }
+
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Lagged(1))));
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_ok());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
     }
 }

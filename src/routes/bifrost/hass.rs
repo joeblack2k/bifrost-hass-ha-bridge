@@ -8,15 +8,15 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post, put};
 use bifrost_api::backend::BackendRequest;
+use hyper::StatusCode;
 use tower_http::services::{ServeDir, ServeFile};
 
 use crate::model::hass::{
-    HassApplyResponse, HassBridgeInfo, HassConnectResponse, HassEntitiesResponse,
-    HassEntityPatchRequest, HassLinkButtonResponse, HassLogsResponse, HassPatinaEventRequest,
-    HassPatinaPublic, HassResetBridgeResponse, HassRoomCreateRequest, HassRoomDeleteRequest,
-    HassRoomRenameRequest, HassRoomsResponse, HassRuntimeConfigPublic, HassRuntimeConfigUpdate,
-    HassSensorKind, HassSwitchMode, HassSyncResponse, HassTokenRequest, HassUiConfig,
-    HassUiPayload,
+    HassBridgeInfo, HassConnectResponse, HassEntitiesResponse, HassEntityPatchRequest,
+    HassLinkButtonResponse, HassLogsResponse, HassPatinaEventRequest, HassPatinaPublic,
+    HassResetBridgeResponse, HassRoomCreateRequest, HassRoomDeleteRequest, HassRoomRenameRequest,
+    HassRoomsResponse, HassRuntimeConfigPublic, HassRuntimeConfigUpdate, HassSensorKind,
+    HassSwitchMode, HassSyncResponse, HassTokenRequest, HassUiConfig, HassUiPayload,
 };
 use crate::routes::bifrost::BifrostApiResult;
 use crate::routes::extractor::Json;
@@ -420,23 +420,33 @@ async fn post_linkbutton(
     }))
 }
 
-async fn post_sync(State(state): State<AppState>) -> BifrostApiResult<Json<HassSyncResponse>> {
+async fn post_sync(
+    State(state): State<AppState>,
+) -> BifrostApiResult<(StatusCode, Json<HassSyncResponse>)> {
     {
         let res = state.res.lock().await;
         res.backend_request(BackendRequest::HassSync)?;
     }
     let sync = state.hass_ui().lock().await.sync.clone();
-    Ok(Json(HassSyncResponse { queued: true, sync }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassSyncResponse { queued: true, sync }),
+    ))
 }
 
-async fn post_apply(State(state): State<AppState>) -> BifrostApiResult<Json<HassApplyResponse>> {
-    let res = state.res.lock().await;
-    res.backend_request(BackendRequest::HassSync)?;
+async fn post_apply(
+    State(state): State<AppState>,
+) -> BifrostApiResult<(StatusCode, Json<HassSyncResponse>)> {
+    {
+        let res = state.res.lock().await;
+        res.backend_request(BackendRequest::HassSync)?;
+    }
+    let sync = state.hass_ui().lock().await.sync.clone();
 
-    Ok(Json(HassApplyResponse {
-        applied: true,
-        removed_devices: 0,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassSyncResponse { queued: true, sync }),
+    ))
 }
 
 async fn post_reset_bridge(
@@ -520,7 +530,7 @@ async fn delete_token(
 
 async fn post_connect(
     State(state): State<AppState>,
-) -> BifrostApiResult<Json<HassConnectResponse>> {
+) -> BifrostApiResult<(StatusCode, Json<HassConnectResponse>)> {
     let runtime_cfg = {
         let runtime = state.hass_runtime();
         let mut lock = runtime.lock().await;
@@ -533,15 +543,19 @@ async fn post_connect(
         res.backend_request(BackendRequest::HassConnect)?;
     }
 
-    Ok(Json(HassConnectResponse {
-        connected: true,
-        runtime: runtime_cfg,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassConnectResponse {
+            queued: true,
+            enabled: true,
+            runtime: runtime_cfg,
+        }),
+    ))
 }
 
 async fn post_disconnect(
     State(state): State<AppState>,
-) -> BifrostApiResult<Json<HassConnectResponse>> {
+) -> BifrostApiResult<(StatusCode, Json<HassConnectResponse>)> {
     let runtime_cfg = {
         let runtime = state.hass_runtime();
         let mut lock = runtime.lock().await;
@@ -554,10 +568,14 @@ async fn post_disconnect(
         res.backend_request(BackendRequest::HassDisconnect)?;
     }
 
-    Ok(Json(HassConnectResponse {
-        connected: false,
-        runtime: runtime_cfg,
-    }))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(HassConnectResponse {
+            queued: true,
+            enabled: false,
+            runtime: runtime_cfg,
+        }),
+    ))
 }
 
 async fn get_patina(State(state): State<AppState>) -> BifrostApiResult<Json<HassPatinaPublic>> {
