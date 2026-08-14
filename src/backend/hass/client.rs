@@ -101,17 +101,19 @@ pub struct HassWs {
 }
 
 impl HassWs {
-    async fn recv_json(&mut self) -> ApiResult<Option<HassWsIncoming>> {
-        if let Some(msg) = self.pending.pop_front() {
-            return Ok(Some(msg));
-        }
-
+    async fn recv_socket_json(&mut self) -> ApiResult<Option<HassWsIncoming>> {
         let Some(msg) = self.socket.next().await else {
             return Ok(None);
         };
         let msg = msg.map_err(ApiError::from)?;
         match msg {
-            Message::Text(text) => Ok(Some(serde_json::from_str::<HassWsIncoming>(&text)?)),
+            Message::Text(text) => match serde_json::from_str::<HassWsIncoming>(&text) {
+                Ok(value) => Ok(Some(value)),
+                Err(err) => {
+                    log::debug!("Ignoring malformed Home Assistant websocket message: {err}");
+                    Ok(Some(HassWsIncoming::Other))
+                }
+            },
             Message::Close(_) => Ok(None),
             Message::Ping(payload) => {
                 self.socket.send(Message::Pong(payload)).await?;
@@ -119,6 +121,13 @@ impl HassWs {
             }
             _ => Ok(Some(HassWsIncoming::Other)),
         }
+    }
+
+    async fn recv_json(&mut self) -> ApiResult<Option<HassWsIncoming>> {
+        if let Some(msg) = self.pending.pop_front() {
+            return Ok(Some(msg));
+        }
+        self.recv_socket_json().await
     }
 
     pub async fn check_liveness(&mut self, wait: Duration) -> ApiResult<()> {
@@ -133,8 +142,11 @@ impl HassWs {
 
         match msg {
             Message::Text(text) => {
-                self.pending
-                    .push_back(serde_json::from_str::<HassWsIncoming>(&text)?);
+                if let Ok(value) = serde_json::from_str::<HassWsIncoming>(&text) {
+                    self.pending.push_back(value);
+                } else {
+                    log::debug!("Ignoring malformed Home Assistant websocket liveness message");
+                }
             }
             Message::Close(_) => {
                 return Err(ApiError::service_error(
@@ -159,6 +171,70 @@ impl HassWs {
             }
         }
         Ok(None)
+    }
+
+    async fn subscribe_events(
+        &mut self,
+        id: u64,
+        event_type: &str,
+        required: bool,
+        wait: Duration,
+    ) -> ApiResult<bool> {
+        let sub = serde_json::json!({
+            "id": id,
+            "type": "subscribe_events",
+            "event_type": event_type,
+        });
+        self.socket
+            .send(Message::Text(sub.to_string().into()))
+            .await?;
+
+        let result = timeout(wait, async {
+            loop {
+                let Some(msg) = self.recv_socket_json().await? else {
+                    return Err(ApiError::service_error(
+                        "Home Assistant websocket closed during subscribe",
+                    ));
+                };
+                match msg {
+                    HassWsIncoming::Result {
+                        id: result_id,
+                        success,
+                        error,
+                    } if result_id == id => {
+                        if success {
+                            return Ok(true);
+                        }
+                        if required {
+                            return Err(ApiError::service_error(format!(
+                                "Home Assistant subscribe_events failed: {}",
+                                error.unwrap_or(Value::Null)
+                            )));
+                        }
+                        return Ok(false);
+                    }
+                    HassWsIncoming::Event { event } => {
+                        self.pending.push_back(HassWsIncoming::Event { event });
+                    }
+                    // A result for a timed-out optional subscription is stale. Do not put it
+                    // back into pending or the next subscription would consume it forever.
+                    HassWsIncoming::Result { .. }
+                    | HassWsIncoming::AuthRequired
+                    | HassWsIncoming::AuthOk
+                    | HassWsIncoming::AuthInvalid
+                    | HassWsIncoming::Other => {}
+                }
+            }
+        })
+        .await;
+
+        match result {
+            Ok(result) => result,
+            Err(_) if required => Err(ApiError::service_error(
+                "Home Assistant websocket state subscription timed out",
+            )),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -478,59 +554,28 @@ impl HassClient {
         }
 
         // Keep state synchronization strict, while accessory event subscriptions are optional.
-        // HA installations differ in which event buses exist; one missing bus must not break the
-        // state stream for every light and sensor.
-        for (id, event_type, required) in [
-            (1_u64, Some("state_changed"), true),
-            (2_u64, Some("zha_event"), false),
-            (3_u64, Some("deconz_event"), false),
-            (4_u64, Some("mqtt_event"), false),
-        ] {
-            let mut sub = serde_json::json!({
-                "id": id,
-                "type": "subscribe_events",
-            });
-            if let Some(event_type) = event_type {
-                sub["event_type"] = Value::String(event_type.to_string());
-            }
-            socket.send(Message::Text(sub.to_string().into())).await?;
-
-            loop {
-                let Some(msg) = socket.next().await else {
-                    return Err(ApiError::service_error(format!(
-                        "[{}] Home Assistant websocket closed during subscribe",
-                        self.backend_name
-                    )));
-                };
-                let msg = msg.map_err(ApiError::from)?;
-                if let Message::Text(text) = msg {
-                    let value: HassWsIncoming = serde_json::from_str(&text)?;
-                    if let HassWsIncoming::Result {
-                        id: result_id,
-                        success,
-                        error,
-                    } = value
-                    {
-                        if result_id != id {
-                            continue;
-                        }
-                        if success || !required {
-                            break;
-                        }
-                        return Err(ApiError::service_error(format!(
-                            "[{}] Home Assistant subscribe_events failed: {}",
-                            self.backend_name,
-                            error.unwrap_or(Value::Null)
-                        )));
-                    }
-                }
+        // Each optional bus has its own short timeout; events received during the handshake are
+        // queued instead of being lost before the realtime loop starts.
+        let mut ws = HassWs {
+            socket,
+            pending: VecDeque::new(),
+        };
+        ws.subscribe_events(1, "state_changed", true, Duration::from_secs(5))
+            .await?;
+        for (id, event_type) in [(2_u64, "zha_event"), (3, "deconz_event"), (4, "mqtt_event")] {
+            if !ws
+                .subscribe_events(id, event_type, false, Duration::from_secs(1))
+                .await?
+            {
+                log::debug!(
+                    "[{}] Optional Home Assistant event subscription unavailable: {}",
+                    self.backend_name,
+                    event_type
+                );
             }
         }
 
-        Ok(HassWs {
-            socket,
-            pending: VecDeque::new(),
-        })
+        Ok(ws)
     }
 
     pub async fn set_entity_registry_disabled(
@@ -625,5 +670,117 @@ impl HassClient {
             "[{}] No websocket response for entity registry update",
             self.backend_name
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::HassWs;
+    use futures::{SinkExt, StreamExt};
+    use std::collections::VecDeque;
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn optional_subscription_timeout_preserves_interleaved_events() {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+                let address = listener.local_addr().expect("address");
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let mut socket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket");
+                    let _ = socket.next().await;
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "type": "event",
+                                "event": {
+                                    "event_type": "zha_event",
+                                    "data": {"entity_id": "event.remote", "command": "press"}
+                                }
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("event");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                });
+
+                let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+                    .await
+                    .expect("connect");
+                let mut ws = HassWs {
+                    socket,
+                    pending: VecDeque::new(),
+                };
+
+                assert!(
+                    !ws.subscribe_events(2, "zha_event", false, Duration::from_millis(20))
+                        .await
+                        .expect("optional timeout")
+                );
+                let event = ws
+                    .next_event()
+                    .await
+                    .expect("event read")
+                    .expect("queued event");
+                assert_eq!(event.event_type, "zha_event");
+                server.await.expect("server");
+            });
+    }
+
+    #[test]
+    fn required_subscription_ignores_malformed_messages_and_surfaces_rejection() {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+                let address = listener.local_addr().expect("address");
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let mut socket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("websocket");
+                    let _ = socket.next().await;
+                    socket
+                        .send(Message::Text("not-json".to_string().into()))
+                        .await
+                        .expect("malformed message");
+                    socket
+                        .send(Message::Text(
+                            serde_json::json!({
+                                "type": "result",
+                                "id": 1,
+                                "success": false,
+                                "error": {"code": "unsupported"}
+                            })
+                            .to_string()
+                            .into(),
+                        ))
+                        .await
+                        .expect("rejection");
+                });
+
+                let (socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+                    .await
+                    .expect("connect");
+                let mut ws = HassWs {
+                    socket,
+                    pending: VecDeque::new(),
+                };
+
+                assert!(
+                    ws.subscribe_events(1, "state_changed", true, Duration::from_secs(1))
+                        .await
+                        .is_err()
+                );
+                server.await.expect("server");
+            });
     }
 }

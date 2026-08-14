@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -403,6 +404,20 @@ impl HassBackend {
                 .map(|rid| RType::Scene.link_to(rid))
                 .collect::<Vec<_>>()
         };
+        let imported_scene_rids = {
+            let lock = self.state.lock().await;
+            scene_links
+                .iter()
+                .filter(|scene_link| {
+                    self.imported_scene_map.contains_key(&scene_link.rid)
+                        || lock
+                            .get::<Scene>(scene_link)
+                            .ok()
+                            .is_some_and(scene_import::is_imported)
+                })
+                .map(|scene_link| scene_link.rid)
+                .collect::<HashSet<_>>()
+        };
         {
             let mut ui = self.ui_state.lock().await;
             ui.remove_room(&room_id);
@@ -411,7 +426,7 @@ impl HassBackend {
         }
 
         for scene_link in &scene_links {
-            if self.imported_scene_map.contains_key(&scene_link.rid) {
+            if imported_scene_rids.contains(&scene_link.rid) {
                 continue;
             }
             if let Err(err) = self
@@ -623,7 +638,7 @@ impl HassBackend {
             }
         }
 
-        if let Some(name) = events::event_name(data) {
+        if let Some(name) = events::normalized_event_name(data) {
             self.ui_log(format!("Accessory event {event_type}: {name}"))
                 .await;
         }

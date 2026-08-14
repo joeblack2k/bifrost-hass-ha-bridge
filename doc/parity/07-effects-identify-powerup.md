@@ -28,4 +28,6 @@ first and the flash is sent as the follow-up action.
 Hue `light.powerup` configuration is bridge-local state. Bifrost validates and persists the typed
 power-up object immediately, while physical runtime state continues to be synchronized through HA.
 Invalid power-up JSON is ignored instead of replacing a known-good configuration. HA entities do
-not advertise a power-up capability unless a future backend can provide an actual startup hook.
+not advertise a default power-up capability unless a future backend can provide an actual startup
+hook. A configured power-up is retained through a temporary unavailable HA light and restored when
+that entity returns.

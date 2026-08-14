@@ -27,7 +27,7 @@ use crate::model::hass::{
 use crate::resource::Resources;
 
 use super::projections;
-use super::{light_projection, scene_import};
+use super::{events, light_projection, scene_import};
 
 #[derive(Clone, Debug)]
 struct ImportedEntity {
@@ -268,15 +268,32 @@ fn parse_imported_entity(state: &HassState, area_name: Option<String>) -> Option
     };
 
     let event_name = matches!(kind, HassEntityKind::Event)
-        .then(|| state.state.clone())
-        .filter(|event| !matches!(event.as_str(), "unknown" | "unavailable"));
+        .then(|| {
+            state
+                .attributes
+                .get("event_type")
+                .and_then(Value::as_str)
+                .map(events::normalize_event_value)
+                .or_else(|| {
+                    let state_value = state.state.trim();
+                    if state_value.is_empty()
+                        || matches!(state_value, "unknown" | "unavailable")
+                        || chrono::DateTime::parse_from_rfc3339(state_value).is_ok()
+                    {
+                        None
+                    } else {
+                        Some(events::normalize_event_value(state_value))
+                    }
+                })
+        })
+        .flatten();
     let event_values = matches!(kind, HassEntityKind::Event)
         .then(|| {
             state
                 .attributes
                 .get("event_types")
-                .cloned()
-                .or_else(|| state.attributes.get("event_values").cloned())
+                .or_else(|| state.attributes.get("event_values"))
+                .and_then(events::normalize_event_values)
         })
         .flatten();
 
@@ -555,10 +572,17 @@ fn make_button_resource(imported: &ImportedEntity, device_link: ResourceLink) ->
             }),
             last_event: event.map(Value::String),
             repeat_interval: Some(100),
-            event_values: imported
-                .event_values
-                .clone()
-                .or_else(|| Some(json!(["initial_press", "repeat"]))),
+            event_values: imported.event_values.clone().or_else(|| {
+                Some(json!([
+                    "initial_press",
+                    "press",
+                    "double_press",
+                    "triple_press",
+                    "hold",
+                    "release",
+                    "repeat"
+                ]))
+            }),
         },
     }
 }
@@ -1316,8 +1340,24 @@ impl HassBackend {
 
         // If the user previously exposed many entities, they may still exist in the persisted
         // Hue resource DB after a restart (since `entity_map` is in-memory only). Always prune
-        // any Home Assistant-generated devices that are no longer included.
-        let keep_device_rids = imported_included
+        // any Home Assistant-generated devices that are no longer included. Keep only unavailable
+        // lights that carry bridge-local power-up state; ordinary unavailable resources retain the
+        // existing include_unavailable behavior.
+        let unavailable_powerup_lights = parsed
+            .iter()
+            .filter_map(|imported| {
+                if imported.kind != HassEntityKind::Light || imported.available {
+                    return None;
+                }
+                let (device_link, service_link) =
+                    self.links_for_entity(&imported.entity_id, imported.service_kind);
+                res.get::<Light>(&service_link)
+                    .ok()
+                    .filter(|light| light.powerup.is_some())
+                    .map(|_| (imported.entity_id.clone(), device_link.rid))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut keep_device_rids = imported_included
             .values()
             .map(|imported| {
                 let (device_link, _service_link) =
@@ -1325,6 +1365,7 @@ impl HassBackend {
                 device_link.rid
             })
             .collect::<HashSet<_>>();
+        keep_device_rids.extend(unavailable_powerup_lights.values().copied());
         let pruned = self.prune_homeassistant_devices(&mut res, &keep_device_rids)?;
         if pruned > 0 {
             self.ui_log(format!(
@@ -1345,13 +1386,15 @@ impl HassBackend {
                 self.sensor_map.remove(&binding.service_link.rid);
                 self.button_map.remove(&binding.service_link.rid);
                 self.device_map.remove(&binding.device_link.rid);
-                if let Err(err) = res.delete(&binding.device_link) {
-                    log::warn!(
-                        "[{}] Failed to delete stale entity {}: {}",
-                        self.name,
-                        entity_id,
-                        err
-                    );
+                if !unavailable_powerup_lights.contains_key(&entity_id) {
+                    if let Err(err) = res.delete(&binding.device_link) {
+                        log::warn!(
+                            "[{}] Failed to delete stale entity {}: {}",
+                            self.name,
+                            entity_id,
+                            err
+                        );
+                    }
                 }
             }
         }
@@ -1701,6 +1744,31 @@ mod tests {
     }
 
     #[test]
+    fn imports_event_entity_as_normalized_button_taxonomy() {
+        let state = HassState {
+            entity_id: "event.dimmer_button".to_string(),
+            state: "2026-08-14T18:45:26.156+00:00".to_string(),
+            attributes: json!({
+                "friendly_name": "Dimmer button",
+                "event_type": "short_release",
+                "event_types": ["initial_press", "repeat", "short_release", "long_press", "long_release"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object attributes"),
+        };
+
+        let imported = parse_imported_entity(&state, None).expect("event entity");
+
+        assert_eq!(imported.kind, HassEntityKind::Event);
+        assert_eq!(imported.event_name.as_deref(), Some("release"));
+        assert_eq!(
+            imported.event_values,
+            Some(json!(["initial_press", "repeat", "release", "hold"]))
+        );
+    }
+
+    #[test]
     fn ha_lights_do_not_advertise_unhandled_hue_controls() {
         let attributes = json!({
             "friendly_name": "On off light",
@@ -1757,6 +1825,31 @@ mod tests {
 
         apply_light_state(&mut light, &imported);
 
+        assert!(light.powerup.is_some());
+    }
+
+    #[test]
+    fn preserves_local_powerup_when_home_assistant_light_is_unavailable() {
+        let state = HassState {
+            entity_id: "light.test".to_string(),
+            state: "unavailable".to_string(),
+            attributes: json!({
+                "friendly_name": "Test light",
+                "supported_color_modes": ["onoff"]
+            })
+            .as_object()
+            .cloned()
+            .expect("object attributes"),
+        };
+        let imported = parse_imported_entity(&state, None).expect("light");
+        let mut light = Light::new(
+            RType::Device.deterministic("test-device"),
+            LightMetadata::new(DeviceArchetype::ClassicBulb, "Test light"),
+        );
+
+        apply_light_state(&mut light, &imported);
+
+        assert!(!imported.available);
         assert!(light.powerup.is_some());
     }
 }
